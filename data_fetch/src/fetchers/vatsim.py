@@ -45,7 +45,9 @@ def process_vatsim_network(
         return False, 0, 0
 
     controllers = payload.get("controllers", [])
+    pilots = payload.get("pilots", [])
     current_callsigns: set[str] = set()
+    current_pilot_callsigns: set[str] = set()
 
     with conn:
         for item in controllers:
@@ -92,6 +94,69 @@ def process_vatsim_network(
                 ),
             )
 
+        for item in pilots:
+            callsign = (item.get("callsign") or "").strip()
+            if not callsign:
+                continue
+
+            flight_plan = item.get("flight_plan") or {}
+            current_pilot_callsigns.add(callsign)
+            conn.execute(
+                """
+                INSERT INTO vatsim_pilots_latest (
+                    callsign, cid, name, server, pilot_rating,
+                    latitude, longitude, altitude, groundspeed,
+                    transponder, heading, qnh_i_hg, qnh_mb,
+                    flight_plan_aircraft, flight_plan_departure,
+                    flight_plan_arrival, flight_plan_altitude,
+                    flight_plan_rules, logon_time, last_updated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(callsign)
+                DO UPDATE SET
+                    cid = excluded.cid,
+                    name = excluded.name,
+                    server = excluded.server,
+                    pilot_rating = excluded.pilot_rating,
+                    latitude = excluded.latitude,
+                    longitude = excluded.longitude,
+                    altitude = excluded.altitude,
+                    groundspeed = excluded.groundspeed,
+                    transponder = excluded.transponder,
+                    heading = excluded.heading,
+                    qnh_i_hg = excluded.qnh_i_hg,
+                    qnh_mb = excluded.qnh_mb,
+                    flight_plan_aircraft = excluded.flight_plan_aircraft,
+                    flight_plan_departure = excluded.flight_plan_departure,
+                    flight_plan_arrival = excluded.flight_plan_arrival,
+                    flight_plan_altitude = excluded.flight_plan_altitude,
+                    flight_plan_rules = excluded.flight_plan_rules,
+                    logon_time = excluded.logon_time,
+                    last_updated = excluded.last_updated
+                """,
+                (
+                    callsign,
+                    to_int(item.get("cid")),
+                    item.get("name"),
+                    item.get("server"),
+                    to_int(item.get("pilot_rating")),
+                    to_float(item.get("latitude")),
+                    to_float(item.get("longitude")),
+                    to_int(item.get("altitude")),
+                    to_int(item.get("groundspeed")),
+                    item.get("transponder"),
+                    to_int(item.get("heading")),
+                    to_float(item.get("qnh_i_hg")),
+                    to_int(item.get("qnh_mb")),
+                    flight_plan.get("aircraft"),
+                    flight_plan.get("departure"),
+                    flight_plan.get("arrival"),
+                    flight_plan.get("altitude"),
+                    flight_plan.get("flight_rules"),
+                    item.get("logon_time"),
+                    update_timestamp,
+                ),
+            )
+
         if current_callsigns:
             placeholders = ",".join("?" for _ in current_callsigns)
             conn.execute(
@@ -100,6 +165,15 @@ def process_vatsim_network(
             )
         else:
             conn.execute("DELETE FROM vatsim_controllers_latest")
+
+        if current_pilot_callsigns:
+            pilot_placeholders = ",".join("?" for _ in current_pilot_callsigns)
+            conn.execute(
+                f"DELETE FROM vatsim_pilots_latest WHERE callsign NOT IN ({pilot_placeholders})",
+                tuple(current_pilot_callsigns),
+            )
+        else:
+            conn.execute("DELETE FROM vatsim_pilots_latest")
 
         update_feed_state(
             conn,
@@ -119,13 +193,15 @@ def process_vatsim_network(
     reload_seconds = max(30, min(120, reload_seconds))
 
     controller_count = len(current_callsigns)
+    pilot_count = len(current_pilot_callsigns)
     LOGGER.info(
-        "%s updated at %s with %s controllers",
+        "%s updated at %s with %s controllers and %s pilots",
         FEED_NAME,
         update_timestamp,
         controller_count,
+        pilot_count,
     )
-    return True, controller_count, reload_seconds
+    return True, controller_count + pilot_count, reload_seconds
 
 
 def next_poll_seconds(last_reload_hint: int | None) -> int:

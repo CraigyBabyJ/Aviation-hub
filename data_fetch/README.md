@@ -1,6 +1,6 @@
 # Aviation Hub Ingestor
 
-Reliable Python ingestion service that runs continuously on Ubuntu 24 headless and stores latest VATSIM + METAR data into SQLite.
+Reliable Python ingestion service that runs continuously on Ubuntu 24 headless and stores latest VATSIM controllers, VATSIM pilots, VATSIM ATIS, and METAR data into SQLite.
 
 ## Project layout
 
@@ -66,6 +66,7 @@ The app enables:
 
 ```bash
 sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS controllers FROM vatsim_controllers_latest;"
+sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS pilots FROM vatsim_pilots_latest;"
 sqlite3 data/aviation_hub.db "SELECT icao, wind_gust_kt, observation_time FROM metar_latest WHERE wind_gust_kt IS NOT NULL ORDER BY wind_gust_kt DESC LIMIT 10;"
 sqlite3 data/aviation_hub.db "SELECT callsign, airport, atis_code, last_updated FROM vatsim_atis_latest ORDER BY last_updated DESC LIMIT 10;"
 ```
