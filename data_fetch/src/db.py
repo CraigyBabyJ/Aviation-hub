@@ -50,6 +50,35 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_vatsim_controllers_lat_lon
             ON vatsim_controllers_latest (latitude, longitude);
 
+        CREATE TABLE IF NOT EXISTS vatsim_pilots_latest (
+            callsign TEXT PRIMARY KEY,
+            cid INTEGER,
+            name TEXT,
+            server TEXT,
+            pilot_rating INTEGER,
+            latitude REAL,
+            longitude REAL,
+            altitude INTEGER,
+            groundspeed INTEGER,
+            transponder TEXT,
+            heading INTEGER,
+            qnh_i_hg REAL,
+            qnh_mb INTEGER,
+            flight_plan_aircraft TEXT,
+            flight_plan_departure TEXT,
+            flight_plan_arrival TEXT,
+            flight_plan_altitude TEXT,
+            flight_plan_rules TEXT,
+            logon_time TEXT,
+            last_updated TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_vatsim_pilots_rating
+            ON vatsim_pilots_latest (pilot_rating);
+        CREATE INDEX IF NOT EXISTS idx_vatsim_pilots_last_updated
+            ON vatsim_pilots_latest (last_updated);
+        CREATE INDEX IF NOT EXISTS idx_vatsim_pilots_lat_lon
+            ON vatsim_pilots_latest (latitude, longitude);
+
         CREATE TABLE IF NOT EXISTS vatsim_atis_latest (
             callsign TEXT PRIMARY KEY,
             airport TEXT,
