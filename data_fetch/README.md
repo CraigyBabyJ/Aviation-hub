@@ -43,6 +43,9 @@ python src/main.py --once
 python src/main.py
 ```
 
+Graceful shutdown:
+- Press `Ctrl+C` once to request a clean stop. The process exits after the current feed work finishes.
+
 ## Data sources and cadence
 
 - VATSIM network JSON: every 60s (uses `general.reload` hint clamped to 30-120 seconds).

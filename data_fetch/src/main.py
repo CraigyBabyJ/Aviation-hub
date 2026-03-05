@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sqlite3
 import time
 from dataclasses import dataclass
+from threading import Event
 
 import requests
 
@@ -15,6 +17,14 @@ from fetchers.vatsim import FEED_NAME as VATSIM_FEED, next_poll_seconds, process
 from util import configure_logging, utc_now_iso
 
 LOGGER = logging.getLogger("aviation_hub.main")
+STOP_EVENT = Event()
+
+
+def _request_shutdown(signum: int, _frame: object) -> None:
+    signal_name = signal.Signals(signum).name
+    if not STOP_EVENT.is_set():
+        LOGGER.info("%s received; shutting down after current cycle", signal_name)
+    STOP_EVENT.set()
 
 
 @dataclass
@@ -35,7 +45,7 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
         for state in polls.values():
             state.next_run = now
 
-    while True:
+    while not STOP_EVENT.is_set():
         now = time.time()
 
         if now >= polls[VATSIM_FEED].next_run:
@@ -85,7 +95,10 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
             return 0
 
         sleep_for = max(1.0, min(state.next_run for state in polls.values()) - time.time())
-        time.sleep(sleep_for)
+        STOP_EVENT.wait(timeout=sleep_for)
+
+    LOGGER.info("Shutdown complete")
+    return 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,6 +110,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     configure_logging()
+    STOP_EVENT.clear()
+    signal.signal(signal.SIGINT, _request_shutdown)
+    signal.signal(signal.SIGTERM, _request_shutdown)
 
     with get_connection() as conn:
         init_db(conn)
