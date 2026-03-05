@@ -22,6 +22,8 @@ FEED_NAME = "vatsim_network"
 
 
 def _fetch_payload(session: requests.Session) -> dict:
+    LOGGER.info("%s fetching network snapshot", FEED_NAME)
+
     def _request() -> dict:
         response = session.get(VATSIM_URL, timeout=(10, 30))
         response.raise_for_status()
@@ -65,6 +67,12 @@ def process_vatsim_network(
 
     state = get_feed_state(conn, FEED_NAME)
     state_last_update = normalize_iso_utc(state["last_update"]) if state else None
+    LOGGER.info(
+        "%s timestamp check: remote=%s local=%s",
+        FEED_NAME,
+        update_timestamp,
+        state_last_update,
+    )
     # Skip unchanged snapshots to avoid unnecessary DB churn.
     if state_last_update == update_timestamp:
         update_feed_state(

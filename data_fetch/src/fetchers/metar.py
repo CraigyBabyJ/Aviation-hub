@@ -17,6 +17,8 @@ FEED_NAME = "aviationweather_metar"
 
 
 def _fetch_payload(session: requests.Session) -> list[dict[str, str]]:
+    LOGGER.info("%s fetching METAR cache", FEED_NAME)
+
     def _request() -> list[dict[str, str]]:
         response = session.get(METAR_URL, timeout=(10, 30))
         response.raise_for_status()

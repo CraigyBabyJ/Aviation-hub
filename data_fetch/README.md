@@ -63,7 +63,9 @@ SQLite DB path: `data/aviation_hub.db`
 
 The app enables:
 - `PRAGMA journal_mode=WAL`
+- `PRAGMA synchronous=FULL`
 - `PRAGMA busy_timeout=5000`
+- single-instance file lock (`data/ingestor.lock`) to prevent multiple writers
 
 ## DB sanity checks
 
