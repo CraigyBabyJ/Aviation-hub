@@ -6,7 +6,15 @@ import sqlite3
 import requests
 
 from db import get_feed_state, update_feed_state
-from util import normalize_iso_utc, to_float, to_int, utc_now_iso, with_retries
+from util import (
+    extract_airport_from_callsign,
+    json_dumps_compact,
+    normalize_iso_utc,
+    to_float,
+    to_int,
+    utc_now_iso,
+    with_retries,
+)
 
 LOGGER = logging.getLogger("aviation_hub.vatsim")
 VATSIM_URL = "https://data.vatsim.net/v3/vatsim-data.json"
@@ -20,6 +28,27 @@ def _fetch_payload(session: requests.Session) -> dict:
         return response.json()
 
     return with_retries(_request, context=FEED_NAME)
+
+
+def _insert_event(
+    conn: sqlite3.Connection,
+    *,
+    ts: str,
+    event_type: str,
+    entity: str,
+    airport: str | None,
+    payload: dict,
+    dedupe_key: str,
+) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO events (ts, type, entity, airport, payload_json, dedupe_key)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(dedupe_key) DO NOTHING
+        """,
+        (ts, event_type, entity, airport, json_dumps_compact(payload), dedupe_key),
+    )
+    return cursor.rowcount
 
 
 def process_vatsim_network(
@@ -56,6 +85,9 @@ def process_vatsim_network(
     pilots = payload.get("pilots", [])
     current_callsigns: set[str] = set()
     current_pilot_callsigns: set[str] = set()
+    current_atc: dict[str, dict] = {}
+    online_events = 0
+    offline_events = 0
 
     with conn:
         for item in controllers:
@@ -63,6 +95,7 @@ def process_vatsim_network(
             if not callsign:
                 continue
             current_callsigns.add(callsign)
+            facility = to_int(item.get("facility"))
             conn.execute(
                 """
                 INSERT INTO vatsim_controllers_latest (
@@ -89,7 +122,7 @@ def process_vatsim_network(
                     callsign,
                     to_int(item.get("cid")),
                     item.get("name"),
-                    to_int(item.get("facility")),
+                    facility,
                     to_int(item.get("rating")),
                     item.get("frequency"),
                     to_float(item.get("latitude")),
@@ -101,6 +134,18 @@ def process_vatsim_network(
                     update_timestamp,
                 ),
             )
+            if facility and facility > 0:
+                current_atc[callsign] = {
+                    "callsign": callsign,
+                    "cid": to_int(item.get("cid")),
+                    "name": item.get("name"),
+                    "facility": facility,
+                    "rating": to_int(item.get("rating")),
+                    "frequency": item.get("frequency"),
+                    "server": item.get("server"),
+                    "logon_time": item.get("logon_time"),
+                    "last_updated": update_timestamp,
+                }
 
         for item in pilots:
             callsign = (item.get("callsign") or "").strip()
@@ -165,6 +210,99 @@ def process_vatsim_network(
                 ),
             )
 
+        try:
+            seen_rows = conn.execute(
+                """
+                SELECT callsign, last_seen, last_frequency, last_facility, last_updated,
+                       cid, name, rating, server, logon_time
+                FROM atc_seen
+                """
+            ).fetchall()
+            seen_by_callsign = {row["callsign"]: row for row in seen_rows}
+            current_atc_callsigns = set(current_atc.keys())
+            seen_callsigns = set(seen_by_callsign.keys())
+
+            for callsign in sorted(current_atc_callsigns - seen_callsigns):
+                item = current_atc[callsign]
+                online_events += _insert_event(
+                    conn,
+                    ts=fetched_at,
+                    event_type="ATC_ONLINE",
+                    entity=callsign,
+                    airport=extract_airport_from_callsign(callsign),
+                    payload=item,
+                    dedupe_key=f"ATC_ONLINE:{callsign}:{item.get('logon_time') or ''}",
+                )
+
+            for callsign in sorted(seen_callsigns - current_atc_callsigns):
+                row = seen_by_callsign[callsign]
+                payload = {
+                    "callsign": callsign,
+                    "cid": row["cid"],
+                    "name": row["name"],
+                    "facility": row["last_facility"],
+                    "rating": row["rating"],
+                    "frequency": row["last_frequency"],
+                    "server": row["server"],
+                    "logon_time": row["logon_time"],
+                    "last_updated": row["last_updated"],
+                }
+                offline_events += _insert_event(
+                    conn,
+                    ts=fetched_at,
+                    event_type="ATC_OFFLINE",
+                    entity=callsign,
+                    airport=extract_airport_from_callsign(callsign),
+                    payload=payload,
+                    dedupe_key=f"ATC_OFFLINE:{callsign}:{row['last_seen']}",
+                )
+
+            for callsign, item in current_atc.items():
+                conn.execute(
+                    """
+                    INSERT INTO atc_seen (
+                        callsign, last_seen, last_status, last_frequency, last_facility,
+                        last_updated, cid, name, rating, server, logon_time
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(callsign)
+                    DO UPDATE SET
+                        last_seen = excluded.last_seen,
+                        last_status = excluded.last_status,
+                        last_frequency = excluded.last_frequency,
+                        last_facility = excluded.last_facility,
+                        last_updated = excluded.last_updated,
+                        cid = excluded.cid,
+                        name = excluded.name,
+                        rating = excluded.rating,
+                        server = excluded.server,
+                        logon_time = excluded.logon_time
+                    """,
+                    (
+                        callsign,
+                        fetched_at,
+                        "online",
+                        item["frequency"],
+                        item["facility"],
+                        item["last_updated"],
+                        item["cid"],
+                        item["name"],
+                        item["rating"],
+                        item["server"],
+                        item["logon_time"],
+                    ),
+                )
+
+            if current_atc_callsigns:
+                placeholders = ",".join("?" for _ in current_atc_callsigns)
+                conn.execute(
+                    f"DELETE FROM atc_seen WHERE callsign NOT IN ({placeholders})",
+                    tuple(current_atc_callsigns),
+                )
+            else:
+                conn.execute("DELETE FROM atc_seen")
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("ATC event processing failed: %s", exc)
+
         if current_callsigns:
             placeholders = ",".join("?" for _ in current_callsigns)
             conn.execute(
@@ -208,6 +346,12 @@ def process_vatsim_network(
         update_timestamp,
         controller_count,
         pilot_count,
+    )
+    LOGGER.info(
+        "%s events created: online=%s offline=%s",
+        FEED_NAME,
+        online_events,
+        offline_events,
     )
     return True, controller_count + pilot_count, reload_seconds
 

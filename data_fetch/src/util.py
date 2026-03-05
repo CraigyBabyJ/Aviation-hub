@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -67,6 +68,19 @@ def normalize_iso_utc(value: str | None) -> str | None:
     if parsed is None:
         return None
     return parsed.isoformat().replace("+00:00", "Z")
+
+
+def json_dumps_compact(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=True, sort_keys=True)
+
+
+def extract_airport_from_callsign(callsign: str | None) -> str | None:
+    if not callsign:
+        return None
+    token = callsign.strip().upper().split("_", 1)[0]
+    if len(token) == 4 and token.isalnum():
+        return token
+    return None
 
 
 def sha256_text(value: str) -> str:

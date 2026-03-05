@@ -115,6 +115,36 @@ def init_db(conn: sqlite3.Connection) -> None:
             ON metar_latest (temp_c);
         CREATE INDEX IF NOT EXISTS idx_metar_observation_time
             ON metar_latest (observation_time);
+
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            type TEXT NOT NULL,
+            entity TEXT NOT NULL,
+            airport TEXT,
+            payload_json TEXT,
+            dedupe_key TEXT UNIQUE
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_ts
+            ON events (ts);
+        CREATE INDEX IF NOT EXISTS idx_events_type
+            ON events (type);
+        CREATE INDEX IF NOT EXISTS idx_events_airport
+            ON events (airport);
+
+        CREATE TABLE IF NOT EXISTS atc_seen (
+            callsign TEXT PRIMARY KEY,
+            last_seen TEXT NOT NULL,
+            last_status TEXT NOT NULL,
+            last_frequency TEXT,
+            last_facility INTEGER,
+            last_updated TEXT,
+            cid INTEGER,
+            name TEXT,
+            rating INTEGER,
+            server TEXT,
+            logon_time TEXT
+        );
         """
     )
     conn.commit()

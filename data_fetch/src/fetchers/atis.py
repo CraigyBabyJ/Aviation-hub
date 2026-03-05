@@ -6,7 +6,14 @@ import sqlite3
 import requests
 
 from db import update_feed_state
-from util import normalize_iso_utc, sha256_text, utc_now_iso, with_retries
+from util import (
+    extract_airport_from_callsign,
+    json_dumps_compact,
+    normalize_iso_utc,
+    sha256_text,
+    utc_now_iso,
+    with_retries,
+)
 
 LOGGER = logging.getLogger("aviation_hub.atis")
 ATIS_URL = "https://data.vatsim.net/v3/afv-atis-data.json"
@@ -29,6 +36,7 @@ def process_atis(conn: sqlite3.Connection, session: requests.Session) -> tuple[b
     fetched_at = utc_now_iso()
     items = _fetch_payload(session)
     upserted = 0
+    atis_changed_events = 0
 
     with conn:
         for item in items:
@@ -41,7 +49,7 @@ def process_atis(conn: sqlite3.Connection, session: requests.Session) -> tuple[b
                 continue
 
             existing = conn.execute(
-                "SELECT last_updated FROM vatsim_atis_latest WHERE callsign = ?",
+                "SELECT last_updated, text_hash FROM vatsim_atis_latest WHERE callsign = ?",
                 (callsign,),
             ).fetchone()
             existing_last_updated = normalize_iso_utc(existing["last_updated"]) if existing else None
@@ -52,6 +60,38 @@ def process_atis(conn: sqlite3.Connection, session: requests.Session) -> tuple[b
             if isinstance(text_lines, str):
                 text_lines = [text_lines]
             text_value = "\n".join(str(line) for line in text_lines)
+            text_hash = sha256_text(text_value)
+            airport = extract_airport_from_callsign(callsign) or callsign[:4]
+
+            try:
+                if existing and existing["text_hash"] and existing["text_hash"] != text_hash:
+                    payload = {
+                        "callsign": callsign,
+                        "airport": airport,
+                        "atis_code": item.get("atis_code"),
+                        "frequency": item.get("frequency"),
+                        "last_updated": last_updated,
+                        "text_hash": text_hash,
+                        "text_preview": text_value[:120],
+                    }
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO events (ts, type, entity, airport, payload_json, dedupe_key)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(dedupe_key) DO NOTHING
+                        """,
+                        (
+                            fetched_at,
+                            "ATIS_CHANGED",
+                            callsign,
+                            airport,
+                            json_dumps_compact(payload),
+                            f"ATIS_CHANGED:{callsign}:{text_hash}",
+                        ),
+                    )
+                    atis_changed_events += cursor.rowcount
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("ATIS event processing failed for %s: %s", callsign, exc)
 
             conn.execute(
                 """
@@ -69,11 +109,11 @@ def process_atis(conn: sqlite3.Connection, session: requests.Session) -> tuple[b
                 """,
                 (
                     callsign,
-                    callsign[:4],
+                    airport,
                     item.get("atis_code"),
                     item.get("frequency"),
                     text_value,
-                    sha256_text(text_value),
+                    text_hash,
                     last_updated,
                 ),
             )
@@ -92,4 +132,5 @@ def process_atis(conn: sqlite3.Connection, session: requests.Session) -> tuple[b
         LOGGER.info("%s unchanged (entries=%s) - skipping update", FEED_NAME, len(items))
     else:
         LOGGER.info("%s processed %s entries (%s upserts)", FEED_NAME, len(items), upserted)
+    LOGGER.info("%s events created: atis_changed=%s", FEED_NAME, atis_changed_events)
     return True, upserted
