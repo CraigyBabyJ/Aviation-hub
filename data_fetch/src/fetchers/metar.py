@@ -9,7 +9,7 @@ import sqlite3
 import requests
 
 from db import update_feed_state
-from util import to_float, to_int, utc_now_iso, with_retries
+from util import normalize_iso_utc, to_float, to_int, utc_now_iso, with_retries
 
 LOGGER = logging.getLogger("aviation_hub.metar")
 METAR_URL = "https://aviationweather.gov/data/cache/metars.cache.csv.gz"
@@ -36,7 +36,7 @@ def process_metar(conn: sqlite3.Connection, session: requests.Session) -> tuple[
     with conn:
         for row in rows:
             icao = (row.get("station_id") or "").strip().upper()
-            obs_time = row.get("observation_time")
+            obs_time = normalize_iso_utc(row.get("observation_time"))
             if not icao or not obs_time:
                 continue
 
@@ -44,7 +44,8 @@ def process_metar(conn: sqlite3.Connection, session: requests.Session) -> tuple[
                 "SELECT observation_time FROM metar_latest WHERE icao = ?",
                 (icao,),
             ).fetchone()
-            if existing and (existing["observation_time"] or "") >= obs_time:
+            existing_observation_time = normalize_iso_utc(existing["observation_time"]) if existing else None
+            if existing_observation_time and existing_observation_time >= obs_time:
                 continue
 
             conn.execute(
@@ -94,5 +95,8 @@ def process_metar(conn: sqlite3.Connection, session: requests.Session) -> tuple[
             last_error_at=None,
         )
 
-    LOGGER.info("%s processed %s rows (%s upserts)", FEED_NAME, len(rows), upserted)
+    if upserted == 0:
+        LOGGER.info("%s unchanged (rows=%s) - skipping update", FEED_NAME, len(rows))
+    else:
+        LOGGER.info("%s processed %s rows (%s upserts)", FEED_NAME, len(rows), upserted)
     return True, upserted

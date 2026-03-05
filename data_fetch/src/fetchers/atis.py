@@ -6,7 +6,7 @@ import sqlite3
 import requests
 
 from db import update_feed_state
-from util import sha256_text, utc_now_iso, with_retries
+from util import normalize_iso_utc, sha256_text, utc_now_iso, with_retries
 
 LOGGER = logging.getLogger("aviation_hub.atis")
 ATIS_URL = "https://data.vatsim.net/v3/afv-atis-data.json"
@@ -36,7 +36,7 @@ def process_atis(conn: sqlite3.Connection, session: requests.Session) -> tuple[b
             if not callsign:
                 continue
 
-            last_updated = item.get("last_updated")
+            last_updated = normalize_iso_utc(item.get("last_updated"))
             if not last_updated:
                 continue
 
@@ -44,7 +44,8 @@ def process_atis(conn: sqlite3.Connection, session: requests.Session) -> tuple[b
                 "SELECT last_updated FROM vatsim_atis_latest WHERE callsign = ?",
                 (callsign,),
             ).fetchone()
-            if existing and (existing["last_updated"] or "") >= last_updated:
+            existing_last_updated = normalize_iso_utc(existing["last_updated"]) if existing else None
+            if existing_last_updated and existing_last_updated >= last_updated:
                 continue
 
             text_lines = item.get("text_atis") or []
@@ -87,5 +88,8 @@ def process_atis(conn: sqlite3.Connection, session: requests.Session) -> tuple[b
             last_error_at=None,
         )
 
-    LOGGER.info("%s processed %s entries (%s upserts)", FEED_NAME, len(items), upserted)
+    if upserted == 0:
+        LOGGER.info("%s unchanged (entries=%s) - skipping update", FEED_NAME, len(items))
+    else:
+        LOGGER.info("%s processed %s entries (%s upserts)", FEED_NAME, len(items), upserted)
     return True, upserted

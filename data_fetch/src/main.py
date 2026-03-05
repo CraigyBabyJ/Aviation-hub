@@ -34,16 +34,51 @@ class PollState:
 
 
 def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool = False) -> int:
+    # In once mode, bypass polling cadence and execute each feed one time.
+    if once:
+        try:
+            process_vatsim_network(conn, session)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("VATSIM processing failed: %s", exc)
+            update_feed_state(
+                conn,
+                feed_name=VATSIM_FEED,
+                last_fetch=utc_now_iso(),
+                last_error=str(exc),
+                last_error_at=utc_now_iso(),
+            )
+
+        try:
+            process_atis(conn, session)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("ATIS processing failed: %s", exc)
+            update_feed_state(
+                conn,
+                feed_name=ATIS_FEED,
+                last_fetch=utc_now_iso(),
+                last_error=str(exc),
+                last_error_at=utc_now_iso(),
+            )
+
+        try:
+            process_metar(conn, session)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("METAR processing failed: %s", exc)
+            update_feed_state(
+                conn,
+                feed_name=METAR_FEED,
+                last_fetch=utc_now_iso(),
+                last_error=str(exc),
+                last_error_at=utc_now_iso(),
+            )
+        return 0
+
     now = time.time()
     polls = {
         VATSIM_FEED: PollState(interval=60, next_run=0.0),
         ATIS_FEED: PollState(interval=60, next_run=0.0),
         METAR_FEED: PollState(interval=600, next_run=0.0),
     }
-
-    if once:
-        for state in polls.values():
-            state.next_run = now
 
     while not STOP_EVENT.is_set():
         now = time.time()
@@ -90,9 +125,6 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
                     last_error_at=utc_now_iso(),
                 )
             polls[METAR_FEED].next_run = now + polls[METAR_FEED].interval
-
-        if once:
-            return 0
 
         sleep_for = max(1.0, min(state.next_run for state in polls.values()) - time.time())
         STOP_EVENT.wait(timeout=sleep_for)

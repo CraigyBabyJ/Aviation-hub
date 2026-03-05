@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+
 import requests
 
 from db import get_feed_state, update_feed_state
-from util import to_float, to_int, utc_now_iso, with_retries
+from util import normalize_iso_utc, to_float, to_int, utc_now_iso, with_retries
 
 LOGGER = logging.getLogger("aviation_hub.vatsim")
 VATSIM_URL = "https://data.vatsim.net/v3/vatsim-data.json"
@@ -28,12 +29,15 @@ def process_vatsim_network(
     fetched_at = utc_now_iso()
     payload = _fetch_payload(session)
 
-    update_timestamp = payload.get("general", {}).get("update_timestamp")
+    # VATSIM's update_timestamp is the authoritative feed-change marker.
+    update_timestamp = normalize_iso_utc(payload.get("general", {}).get("update_timestamp"))
     if not update_timestamp:
         raise ValueError("VATSIM payload missing general.update_timestamp")
 
     state = get_feed_state(conn, FEED_NAME)
-    if state and state["last_update"] == update_timestamp:
+    state_last_update = normalize_iso_utc(state["last_update"]) if state else None
+    # Skip unchanged snapshots to avoid unnecessary DB churn.
+    if state_last_update == update_timestamp:
         update_feed_state(
             conn,
             feed_name=FEED_NAME,
@@ -41,7 +45,11 @@ def process_vatsim_network(
             last_error=None,
             last_error_at=None,
         )
-        LOGGER.info("%s unchanged (%s); skipping upsert", FEED_NAME, update_timestamp)
+        LOGGER.info(
+            "%s unchanged (timestamp=%s) - skipping update",
+            FEED_NAME,
+            update_timestamp,
+        )
         return False, 0, 0
 
     controllers = payload.get("controllers", [])

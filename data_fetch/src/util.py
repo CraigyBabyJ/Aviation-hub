@@ -23,6 +23,52 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def parse_iso_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+
+    if "." in text:
+        head, tail = text.split(".", 1)
+        frac_digits = []
+        rest_start = 0
+        for idx, ch in enumerate(tail):
+            if ch.isdigit():
+                frac_digits.append(ch)
+                continue
+            rest_start = idx
+            break
+        else:
+            rest_start = len(tail)
+
+        if frac_digits:
+            frac = "".join(frac_digits)[:6]
+            text = f"{head}.{frac}{tail[rest_start:]}"
+
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+        parsed = parsed.astimezone(timezone.utc)
+    return parsed
+
+
+def normalize_iso_utc(value: str | None) -> str | None:
+    parsed = parse_iso_utc(value)
+    if parsed is None:
+        return None
+    return parsed.isoformat().replace("+00:00", "Z")
+
+
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
