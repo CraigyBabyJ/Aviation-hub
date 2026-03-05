@@ -1,0 +1,17 @@
+[Unit]
+Description=Aviation Hub Ingestion Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+WorkingDirectory=/path/to/data_fetch
+ExecStart=/path/to/data_fetch/.venv/bin/python /path/to/data_fetch/src/main.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
