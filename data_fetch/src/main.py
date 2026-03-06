@@ -15,6 +15,8 @@ import requests
 from db import get_connection, init_db, update_feed_state
 from fetchers.atis import FEED_NAME as ATIS_FEED, process_atis
 from fetchers.metar import FEED_NAME as METAR_FEED, process_metar
+from fetchers.ourairports import FEED_NAME as OURAIRPORTS_FEED, process_ourairports
+from fetchers.taf import FEED_NAME as TAF_FEED, process_taf
 from fetchers.vatsim import FEED_NAME as VATSIM_FEED, next_poll_seconds, process_vatsim_network
 from util import configure_logging, utc_now_iso
 
@@ -78,6 +80,32 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
                 last_error=str(exc),
                 last_error_at=utc_now_iso(),
             )
+
+        try:
+            LOGGER.info("Checking %s", TAF_FEED)
+            process_taf(conn, session)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("TAF processing failed: %s", exc)
+            update_feed_state(
+                conn,
+                feed_name=TAF_FEED,
+                last_fetch=utc_now_iso(),
+                last_error=str(exc),
+                last_error_at=utc_now_iso(),
+            )
+
+        try:
+            LOGGER.info("Checking %s", OURAIRPORTS_FEED)
+            process_ourairports(conn, session)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("OurAirports processing failed: %s", exc)
+            update_feed_state(
+                conn,
+                feed_name=OURAIRPORTS_FEED,
+                last_fetch=utc_now_iso(),
+                last_error=str(exc),
+                last_error_at=utc_now_iso(),
+            )
         return 0
 
     now = time.time()
@@ -85,6 +113,8 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
         VATSIM_FEED: PollState(interval=60, next_run=0.0),
         ATIS_FEED: PollState(interval=60, next_run=0.0),
         METAR_FEED: PollState(interval=600, next_run=0.0),
+        TAF_FEED: PollState(interval=1800, next_run=0.0),
+        OURAIRPORTS_FEED: PollState(interval=3600, next_run=0.0),
     }
 
     while not STOP_EVENT.is_set():
@@ -150,6 +180,46 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
                     last_error_at=utc_now_iso(),
                 )
             polls[METAR_FEED].next_run = now + polls[METAR_FEED].interval
+
+        if now >= polls[TAF_FEED].next_run:
+            try:
+                LOGGER.info("Checking %s", TAF_FEED)
+                process_taf(conn, session)
+                LOGGER.info(
+                    "%s check complete; next check in %ss",
+                    TAF_FEED,
+                    polls[TAF_FEED].interval,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("TAF processing failed: %s", exc)
+                update_feed_state(
+                    conn,
+                    feed_name=TAF_FEED,
+                    last_fetch=utc_now_iso(),
+                    last_error=str(exc),
+                    last_error_at=utc_now_iso(),
+                )
+            polls[TAF_FEED].next_run = now + polls[TAF_FEED].interval
+
+        if now >= polls[OURAIRPORTS_FEED].next_run:
+            try:
+                LOGGER.info("Checking %s", OURAIRPORTS_FEED)
+                process_ourairports(conn, session)
+                LOGGER.info(
+                    "%s check complete; next check in %ss",
+                    OURAIRPORTS_FEED,
+                    polls[OURAIRPORTS_FEED].interval,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("OurAirports processing failed: %s", exc)
+                update_feed_state(
+                    conn,
+                    feed_name=OURAIRPORTS_FEED,
+                    last_fetch=utc_now_iso(),
+                    last_error=str(exc),
+                    last_error_at=utc_now_iso(),
+                )
+            polls[OURAIRPORTS_FEED].next_run = now + polls[OURAIRPORTS_FEED].interval
 
         sleep_for = max(1.0, min(state.next_run for state in polls.values()) - time.time())
         STOP_EVENT.wait(timeout=sleep_for)

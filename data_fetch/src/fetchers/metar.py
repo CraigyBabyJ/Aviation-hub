@@ -9,6 +9,7 @@ import sqlite3
 import requests
 
 from db import update_feed_state
+from fetchers.weather_derivation import recalc_latest_weather
 from util import normalize_iso_utc, to_float, to_int, utc_now_iso, with_retries
 
 LOGGER = logging.getLogger("aviation_hub.metar")
@@ -101,4 +102,15 @@ def process_metar(conn: sqlite3.Connection, session: requests.Session) -> tuple[
         LOGGER.info("%s unchanged (rows=%s) - skipping update", FEED_NAME, len(rows))
     else:
         LOGGER.info("%s processed %s rows (%s upserts)", FEED_NAME, len(rows), upserted)
+
+    try:
+        flags_upserted, scores_upserted = recalc_latest_weather(conn)
+        LOGGER.info(
+            "%s derived weather refreshed (flags=%s scores=%s)",
+            FEED_NAME,
+            flags_upserted,
+            scores_upserted,
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("%s weather derivation failed: %s", FEED_NAME, exc)
     return True, upserted

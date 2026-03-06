@@ -53,6 +53,100 @@ def _insert_event(
     return cursor.rowcount
 
 
+def _find_active_session_id(conn: sqlite3.Connection, callsign: str) -> int | None:
+    row = conn.execute(
+        """
+        SELECT id
+        FROM atc_sessions
+        WHERE callsign = ? AND is_active = 1
+        ORDER BY started_at DESC, id DESC
+        LIMIT 1
+        """,
+        (callsign,),
+    ).fetchone()
+    return to_int(row["id"]) if row else None
+
+
+def _open_atc_session(conn: sqlite3.Connection, *, ts: str, item: dict) -> bool:
+    callsign = (item.get("callsign") or "").strip()
+    if not callsign:
+        return False
+    if _find_active_session_id(conn, callsign) is not None:
+        return False
+
+    conn.execute(
+        """
+        INSERT INTO atc_sessions (
+            callsign, airport, facility, frequency, name, cid, logon_time,
+            started_at, last_seen, is_active
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        """,
+        (
+            callsign,
+            extract_airport_from_callsign(callsign),
+            to_int(item.get("facility")),
+            item.get("frequency"),
+            item.get("name"),
+            to_int(item.get("cid")),
+            item.get("logon_time"),
+            ts,
+            ts,
+        ),
+    )
+    return True
+
+
+def _touch_atc_session(conn: sqlite3.Connection, *, ts: str, item: dict) -> bool:
+    callsign = (item.get("callsign") or "").strip()
+    if not callsign:
+        return False
+    active_id = _find_active_session_id(conn, callsign)
+    if active_id is None:
+        return False
+
+    conn.execute(
+        """
+        UPDATE atc_sessions
+        SET
+            last_seen = ?,
+            frequency = COALESCE(?, frequency),
+            facility = COALESCE(?, facility),
+            name = COALESCE(?, name),
+            cid = COALESCE(?, cid),
+            logon_time = COALESCE(?, logon_time),
+            airport = COALESCE(?, airport)
+        WHERE id = ?
+        """,
+        (
+            ts,
+            item.get("frequency"),
+            to_int(item.get("facility")),
+            item.get("name"),
+            to_int(item.get("cid")),
+            item.get("logon_time"),
+            extract_airport_from_callsign(callsign),
+            active_id,
+        ),
+    )
+    return True
+
+
+def _close_atc_session(conn: sqlite3.Connection, *, ts: str, callsign: str) -> bool:
+    active_id = _find_active_session_id(conn, callsign)
+    if active_id is None:
+        return False
+
+    conn.execute(
+        """
+        UPDATE atc_sessions
+        SET ended_at = ?, last_seen = ?, is_active = 0
+        WHERE id = ?
+        """,
+        (ts, ts, active_id),
+    )
+    return True
+
+
 def process_vatsim_network(
     conn: sqlite3.Connection,
     session: requests.Session,
@@ -96,6 +190,9 @@ def process_vatsim_network(
     current_atc: dict[str, dict] = {}
     online_events = 0
     offline_events = 0
+    sessions_opened = 0
+    sessions_updated = 0
+    sessions_closed = 0
 
     with conn:
         for item in controllers:
@@ -241,6 +338,8 @@ def process_vatsim_network(
                     payload=item,
                     dedupe_key=f"ATC_ONLINE:{callsign}:{item.get('logon_time') or ''}",
                 )
+                if _open_atc_session(conn, ts=fetched_at, item=item):
+                    sessions_opened += 1
 
             for callsign in sorted(seen_callsigns - current_atc_callsigns):
                 row = seen_by_callsign[callsign]
@@ -264,6 +363,12 @@ def process_vatsim_network(
                     payload=payload,
                     dedupe_key=f"ATC_OFFLINE:{callsign}:{row['last_seen']}",
                 )
+                if _close_atc_session(conn, ts=fetched_at, callsign=callsign):
+                    sessions_closed += 1
+
+            for item in current_atc.values():
+                if _touch_atc_session(conn, ts=fetched_at, item=item):
+                    sessions_updated += 1
 
             for callsign, item in current_atc.items():
                 conn.execute(
@@ -360,6 +465,13 @@ def process_vatsim_network(
         FEED_NAME,
         online_events,
         offline_events,
+    )
+    LOGGER.info(
+        "%s sessions: opened=%s updated=%s closed=%s",
+        FEED_NAME,
+        sessions_opened,
+        sessions_updated,
+        sessions_closed,
     )
     return True, controller_count + pilot_count, reload_seconds
 
