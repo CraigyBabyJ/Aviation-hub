@@ -208,6 +208,139 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_weather_score_airport_ts
             ON airport_weather_score_latest (airport, ts);
 
+        CREATE TABLE IF NOT EXISTS airport_live_status_latest (
+            airport TEXT PRIMARY KEY,
+            ts TEXT NOT NULL,
+            name TEXT,
+            country TEXT,
+            region TEXT,
+            continent TEXT,
+            municipality TEXT,
+            latitude_deg REAL,
+            longitude_deg REAL,
+            type TEXT,
+            has_atc INTEGER NOT NULL DEFAULT 0,
+            controller_count INTEGER NOT NULL DEFAULT 0,
+            has_atis INTEGER NOT NULL DEFAULT 0,
+            atis_callsign TEXT,
+            atis_frequency TEXT,
+            has_snow INTEGER NOT NULL DEFAULT 0,
+            has_rain INTEGER NOT NULL DEFAULT 0,
+            has_thunderstorm INTEGER NOT NULL DEFAULT 0,
+            has_freezing_precip INTEGER NOT NULL DEFAULT 0,
+            has_fog INTEGER NOT NULL DEFAULT 0,
+            has_mist INTEGER NOT NULL DEFAULT 0,
+            has_haze INTEGER NOT NULL DEFAULT 0,
+            has_dust_sand INTEGER NOT NULL DEFAULT 0,
+            has_showers INTEGER NOT NULL DEFAULT 0,
+            has_squalls INTEGER NOT NULL DEFAULT 0,
+            is_gusty INTEGER NOT NULL DEFAULT 0,
+            is_low_visibility INTEGER NOT NULL DEFAULT 0,
+            is_low_ceiling INTEGER NOT NULL DEFAULT 0,
+            overall_score REAL NOT NULL DEFAULT 0,
+            challenge_level TEXT,
+            flight_category TEXT,
+            wind_dir_degrees INTEGER,
+            wind_speed_kt INTEGER,
+            wind_gust_kt INTEGER,
+            visibility_meters INTEGER,
+            ceiling_ft_agl INTEGER,
+            raw_metar TEXT,
+            raw_taf TEXT,
+            wx_summary TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_airport_live_country
+            ON airport_live_status_latest (country);
+        CREATE INDEX IF NOT EXISTS idx_airport_live_region
+            ON airport_live_status_latest (region);
+        CREATE INDEX IF NOT EXISTS idx_airport_live_continent
+            ON airport_live_status_latest (continent);
+        CREATE INDEX IF NOT EXISTS idx_airport_live_has_atc
+            ON airport_live_status_latest (has_atc);
+        CREATE INDEX IF NOT EXISTS idx_airport_live_has_snow
+            ON airport_live_status_latest (has_snow);
+        CREATE INDEX IF NOT EXISTS idx_airport_live_has_thunderstorm
+            ON airport_live_status_latest (has_thunderstorm);
+        CREATE INDEX IF NOT EXISTS idx_airport_live_overall_score
+            ON airport_live_status_latest (overall_score);
+        CREATE INDEX IF NOT EXISTS idx_airport_live_challenge_level
+            ON airport_live_status_latest (challenge_level);
+        CREATE INDEX IF NOT EXISTS idx_airport_live_airport_ts
+            ON airport_live_status_latest (airport, ts);
+
+        CREATE TABLE IF NOT EXISTS airport_runways_latest (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            airport_ident TEXT NOT NULL,
+            airport_icao TEXT,
+            length_ft INTEGER,
+            width_ft INTEGER,
+            surface TEXT,
+            surface_class TEXT,
+            lighted INTEGER,
+            closed INTEGER,
+            le_ident TEXT,
+            he_ident TEXT,
+            le_heading_degT REAL,
+            he_heading_degT REAL,
+            source_hash TEXT,
+            last_updated TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_airport_runways_ident
+            ON airport_runways_latest (airport_ident);
+        CREATE INDEX IF NOT EXISTS idx_airport_runways_icao
+            ON airport_runways_latest (airport_icao);
+        CREATE INDEX IF NOT EXISTS idx_airport_runways_closed
+            ON airport_runways_latest (closed);
+        CREATE INDEX IF NOT EXISTS idx_airport_runways_surface_class
+            ON airport_runways_latest (surface_class);
+
+        CREATE TABLE IF NOT EXISTS airport_runway_summary_latest (
+            airport TEXT PRIMARY KEY,
+            ts TEXT NOT NULL,
+            runway_count INTEGER NOT NULL DEFAULT 0,
+            active_runway_count INTEGER NOT NULL DEFAULT 0,
+            longest_runway_ft INTEGER NOT NULL DEFAULT 0,
+            longest_hard_runway_ft INTEGER NOT NULL DEFAULT 0,
+            longest_soft_runway_ft INTEGER NOT NULL DEFAULT 0,
+            widest_runway_ft INTEGER NOT NULL DEFAULT 0,
+            has_hard_surface INTEGER NOT NULL DEFAULT 0,
+            has_soft_surface INTEGER NOT NULL DEFAULT 0,
+            has_water_runway INTEGER NOT NULL DEFAULT 0,
+            has_lighted_runway INTEGER NOT NULL DEFAULT 0,
+            all_runways_closed INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_runway_summary_longest
+            ON airport_runway_summary_latest (longest_runway_ft);
+        CREATE INDEX IF NOT EXISTS idx_runway_summary_longest_hard
+            ON airport_runway_summary_latest (longest_hard_runway_ft);
+        CREATE INDEX IF NOT EXISTS idx_runway_summary_airport_ts
+            ON airport_runway_summary_latest (airport, ts);
+
+        CREATE TABLE IF NOT EXISTS airport_aircraft_suitability_latest (
+            airport TEXT PRIMARY KEY,
+            ts TEXT NOT NULL,
+            suitable_airliner_jet INTEGER NOT NULL DEFAULT 0,
+            suitable_regional_jet INTEGER NOT NULL DEFAULT 0,
+            suitable_turboprop INTEGER NOT NULL DEFAULT 0,
+            suitable_ga_piston INTEGER NOT NULL DEFAULT 0,
+            suitable_business_jet INTEGER NOT NULL DEFAULT 0,
+            best_runway_ft INTEGER NOT NULL DEFAULT 0,
+            best_hard_runway_ft INTEGER NOT NULL DEFAULT 0,
+            best_soft_runway_ft INTEGER NOT NULL DEFAULT 0,
+            airport_type TEXT,
+            suitability_notes TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_suitability_airliner
+            ON airport_aircraft_suitability_latest (suitable_airliner_jet);
+        CREATE INDEX IF NOT EXISTS idx_suitability_regional
+            ON airport_aircraft_suitability_latest (suitable_regional_jet);
+        CREATE INDEX IF NOT EXISTS idx_suitability_turboprop
+            ON airport_aircraft_suitability_latest (suitable_turboprop);
+        CREATE INDEX IF NOT EXISTS idx_suitability_ga
+            ON airport_aircraft_suitability_latest (suitable_ga_piston);
+        CREATE INDEX IF NOT EXISTS idx_suitability_bizjet
+            ON airport_aircraft_suitability_latest (suitable_business_jet);
+
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,

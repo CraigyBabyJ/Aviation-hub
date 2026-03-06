@@ -54,6 +54,10 @@ sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS pilots FROM vatsim_pilots_lates
 sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS atis FROM vatsim_atis_latest;"
 sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS metar FROM metar_latest;"
 sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS taf FROM taf_latest;"
+sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS live_status FROM airport_live_status_latest;"
+sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS runways FROM airport_runways_latest;"
+sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS runway_summary FROM airport_runway_summary_latest;"
+sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS suitability FROM airport_aircraft_suitability_latest;"
 ```
 
 Event throughput:
@@ -89,6 +93,46 @@ Sessions today for one airport (example `EGCC`):
 sqlite3 data/aviation_hub.db "SELECT COUNT(*) FROM atc_sessions WHERE airport='EGCC' AND date(started_at)=date('now');"
 ```
 
+## Airport live/weather checks
+
+Airports with ATC and/or ATIS:
+
+```bash
+sqlite3 data/aviation_hub.db "SELECT SUM(has_atc) AS airports_with_atc, SUM(has_atis) AS airports_with_atis FROM airport_live_status_latest;"
+```
+
+Top challenging airports:
+
+```bash
+sqlite3 -header -column data/aviation_hub.db "SELECT airport, country, overall_score, challenge_level, flight_category FROM airport_live_status_latest ORDER BY overall_score DESC LIMIT 30;"
+```
+
+Snow + ATC airports:
+
+```bash
+sqlite3 -header -column data/aviation_hub.db "SELECT airport, country, controller_count, overall_score FROM airport_live_status_latest WHERE has_snow=1 AND has_atc=1 ORDER BY overall_score DESC;"
+```
+
+## Runway / suitability checks
+
+Suitability totals:
+
+```bash
+sqlite3 -header -column data/aviation_hub.db "SELECT SUM(suitable_airliner_jet) AS airliner, SUM(suitable_regional_jet) AS regional, SUM(suitable_turboprop) AS turboprop, SUM(suitable_ga_piston) AS ga, SUM(suitable_business_jet) AS bizjet FROM airport_aircraft_suitability_latest;"
+```
+
+Airliner-suitable airports:
+
+```bash
+sqlite3 -header -column data/aviation_hub.db "SELECT airport, best_hard_runway_ft, airport_type FROM airport_aircraft_suitability_latest WHERE suitable_airliner_jet=1 ORDER BY best_hard_runway_ft DESC LIMIT 50;"
+```
+
+Regional-jet + spicy weather:
+
+```bash
+sqlite3 -header -column data/aviation_hub.db "SELECT l.airport, l.country, l.overall_score, l.challenge_level FROM airport_live_status_latest l JOIN airport_aircraft_suitability_latest s ON s.airport=l.airport WHERE s.suitable_regional_jet=1 ORDER BY l.overall_score DESC LIMIT 50;"
+```
+
 ## Backfill sessions from events
 
 Use when `atc_sessions` is empty or needs rebuild:
@@ -110,4 +154,5 @@ Notes:
 - `vatsim_atis` -> `vatsim_atis_latest`, `ATIS_CHANGED` events
 - `aviationweather_metar` -> `metar_latest`
 - `aviationweather_taf` -> `taf_latest`
-- `ourairports_sync` -> local CSV files in `data/ourairports/`
+- `ourairports_sync` -> local CSV files in `data/ourairports/`, `airport_reference_latest`, runway/suitability tables
+- `airport_live_status_latest` -> derived joined snapshot (airport metadata + ATC/ATIS + weather)

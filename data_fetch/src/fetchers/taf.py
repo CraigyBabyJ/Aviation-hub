@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 import requests
 
 from db import update_feed_state
+from fetchers.airport_live_status import refresh_airport_live_status
 from fetchers.weather_derivation import recalc_latest_weather
 from util import normalize_iso_utc, to_float, utc_now_iso, with_retries
 
@@ -115,4 +116,9 @@ def process_taf(conn: sqlite3.Connection, session: requests.Session) -> tuple[bo
         )
     except Exception as exc:  # noqa: BLE001
         LOGGER.exception("%s weather derivation failed: %s", FEED_NAME, exc)
+    try:
+        refreshed = refresh_airport_live_status(conn)
+        LOGGER.info("%s airport_live_status refreshed (%s rows)", FEED_NAME, refreshed)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("%s airport_live_status refresh failed: %s", FEED_NAME, exc)
     return True, upserted

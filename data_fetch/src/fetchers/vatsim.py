@@ -6,6 +6,7 @@ import sqlite3
 import requests
 
 from db import get_feed_state, update_feed_state
+from fetchers.airport_live_status import refresh_airport_live_status
 from util import (
     extract_airport_from_callsign,
     json_dumps_compact,
@@ -473,6 +474,11 @@ def process_vatsim_network(
         sessions_updated,
         sessions_closed,
     )
+    try:
+        refreshed = refresh_airport_live_status(conn)
+        LOGGER.info("%s airport_live_status refreshed (%s rows)", FEED_NAME, refreshed)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("%s airport_live_status refresh failed: %s", FEED_NAME, exc)
     return True, controller_count + pilot_count, reload_seconds
 
 

@@ -10,6 +10,8 @@ from pathlib import Path
 import requests
 
 from db import get_feed_state, update_feed_state
+from fetchers.airport_live_status import refresh_airport_live_status
+from fetchers.runway_enrichment import refresh_runway_enrichment
 from util import parse_iso_utc, to_float, to_int, utc_now_iso, with_retries
 
 LOGGER = logging.getLogger("aviation_hub.ourairports")
@@ -93,6 +95,9 @@ def process_ourairports(conn: sqlite3.Connection, session: requests.Session) -> 
 
     if last_success and (now - last_success) < MIN_SYNC_INTERVAL:
         ref_rows = _sync_airport_reference(conn)
+        runway_rows, runway_summary_rows, suitability_rows = refresh_runway_enrichment(
+            conn, OUT_DIR / "runways.csv"
+        )
         next_due = last_success + MIN_SYNC_INTERVAL
         update_feed_state(
             conn,
@@ -109,6 +114,19 @@ def process_ourairports(conn: sqlite3.Connection, session: requests.Session) -> 
         )
         if ref_rows > 0:
             LOGGER.info("%s refreshed airport reference rows from disk (%s)", FEED_NAME, ref_rows)
+        if runway_rows > 0:
+            LOGGER.info(
+                "%s refreshed runway enrichment from disk (runways=%s summary=%s suitability=%s)",
+                FEED_NAME,
+                runway_rows,
+                runway_summary_rows,
+                suitability_rows,
+            )
+        try:
+            refreshed = refresh_airport_live_status(conn)
+            LOGGER.info("%s airport_live_status refreshed (%s rows)", FEED_NAME, refreshed)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("%s airport_live_status refresh failed: %s", FEED_NAME, exc)
         return False, 0
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -124,6 +142,9 @@ def process_ourairports(conn: sqlite3.Connection, session: requests.Session) -> 
         LOGGER.info("%s saved %s (%s bytes)", FEED_NAME, target, target.stat().st_size)
 
     ref_rows = _sync_airport_reference(conn)
+    runway_rows, runway_summary_rows, suitability_rows = refresh_runway_enrichment(
+        conn, OUT_DIR / "runways.csv"
+    )
 
     update_feed_state(
         conn,
@@ -133,5 +154,18 @@ def process_ourairports(conn: sqlite3.Connection, session: requests.Session) -> 
         last_error=None,
         last_error_at=None,
     )
-    LOGGER.info("%s sync complete (%s files, %s airport reference rows)", FEED_NAME, files_written, ref_rows)
+    LOGGER.info(
+        "%s sync complete (%s files, airport_ref=%s, runways=%s, runway_summary=%s, suitability=%s)",
+        FEED_NAME,
+        files_written,
+        ref_rows,
+        runway_rows,
+        runway_summary_rows,
+        suitability_rows,
+    )
+    try:
+        refreshed = refresh_airport_live_status(conn)
+        LOGGER.info("%s airport_live_status refreshed (%s rows)", FEED_NAME, refreshed)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("%s airport_live_status refresh failed: %s", FEED_NAME, exc)
     return True, files_written

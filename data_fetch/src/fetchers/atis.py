@@ -6,6 +6,7 @@ import sqlite3
 import requests
 
 from db import update_feed_state
+from fetchers.airport_live_status import refresh_airport_live_status
 from util import (
     extract_airport_from_callsign,
     json_dumps_compact,
@@ -135,4 +136,9 @@ def process_atis(conn: sqlite3.Connection, session: requests.Session) -> tuple[b
     else:
         LOGGER.info("%s processed %s entries (%s upserts)", FEED_NAME, len(items), upserted)
     LOGGER.info("%s events created: atis_changed=%s", FEED_NAME, atis_changed_events)
+    try:
+        refreshed = refresh_airport_live_status(conn)
+        LOGGER.info("%s airport_live_status refreshed (%s rows)", FEED_NAME, refreshed)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("%s airport_live_status refresh failed: %s", FEED_NAME, exc)
     return True, upserted
