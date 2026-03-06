@@ -50,6 +50,25 @@ python src/main.py --once
 python src/main.py
 ```
 
+## Run widget endpoint
+
+```bash
+. .venv/bin/activate
+python src/widget_server.py --host 0.0.0.0 --port 4010
+```
+
+Widget route:
+
+```text
+GET /widgets/current-spicy-airports
+```
+
+Example:
+
+```bash
+curl -sS http://localhost:4010/widgets/current-spicy-airports
+```
+
 Graceful shutdown:
 - Press `Ctrl+C` once to request a clean stop. The process exits after the current feed work finishes.
 
@@ -235,6 +254,22 @@ WHERE s.suitable_airliner_jet = 1
 ORDER BY l.overall_score DESC
 LIMIT 50;
 ```
+
+## Widget response shape
+
+`GET /widgets/current-spicy-airports` returns:
+
+- `generated_at`
+- `airliner` (or `null`)
+- `ga` (or `null`)
+
+Each category object includes:
+- airport identity (`airport`, `name`, `country`, `region`)
+- weather severity (`overall_score`, `challenge_level`, `flight_category`)
+- weather flags (`has_snow`, `has_thunderstorm`, `is_gusty`, `is_low_visibility`, `is_low_ceiling`)
+- key metrics (`wind_gust_kt`, `visibility_meters`)
+- daylight preference fields (`day_state`, `is_daylight`)
+- computed rank (`spicy_rank`)
 
 ## Backfill
 

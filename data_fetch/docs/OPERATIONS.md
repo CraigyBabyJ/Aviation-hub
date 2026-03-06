@@ -29,6 +29,22 @@ Recent errors only:
 journalctl -u aviation-hub.service -n 400 --no-pager | rg -i "error|exception|traceback|failed"
 ```
 
+## Widget endpoint
+
+Start widget server:
+
+```bash
+cd /home/craig/projects/Aviation-hub/data_fetch
+. .venv/bin/activate
+python src/widget_server.py --host 0.0.0.0 --port 4010
+```
+
+Request widget JSON:
+
+```bash
+curl -sS http://localhost:4010/widgets/current-spicy-airports | jq .
+```
+
 ## Feed cadence (current)
 
 - `vatsim_network`: dynamic (30-120s, usually ~60s)
