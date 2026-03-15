@@ -54,6 +54,32 @@ def process_metar(conn: sqlite3.Connection, session: requests.Session) -> tuple[
 
             conn.execute(
                 """
+                INSERT INTO metar_history (
+                    icao, observation_time, raw_text, latitude, longitude,
+                    temp_c, dewpoint_c, wind_dir_degrees, wind_speed_kt,
+                    wind_gust_kt, visibility_statute_mi, altim_in_hg, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(icao, observation_time) DO NOTHING
+                """,
+                (
+                    icao,
+                    obs_time,
+                    row.get("raw_text"),
+                    to_float(row.get("latitude")),
+                    to_float(row.get("longitude")),
+                    to_float(row.get("temp_c")),
+                    to_float(row.get("dewpoint_c")),
+                    to_int(row.get("wind_dir_degrees")),
+                    to_int(row.get("wind_speed_kt")),
+                    to_int(row.get("wind_gust_kt")),
+                    to_float(row.get("visibility_statute_mi")),
+                    to_float(row.get("altim_in_hg")),
+                    fetched_at,
+                ),
+            )
+
+            conn.execute(
+                """
                 INSERT INTO metar_latest (
                     icao, observation_time, raw_text, latitude, longitude,
                     temp_c, dewpoint_c, wind_dir_degrees, wind_speed_kt,

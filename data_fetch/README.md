@@ -15,11 +15,13 @@ data_fetch/
 │   ├── db.py
 │   ├── main.py
 │   ├── util.py
+│   ├── widget_server.py
 │   └── fetchers/
 │       ├── airport_live_status.py
 │       ├── atis.py
 │       ├── metar.py
 │       ├── ourairports.py
+│       ├── sigmet.py
 │       ├── runway_enrichment.py
 │       ├── taf.py
 │       └── vatsim.py
@@ -50,24 +52,61 @@ python src/main.py --once
 python src/main.py
 ```
 
-## Run widget endpoint
+## Widget endpoint
+
+The widget HTTP endpoint is started automatically by `src/main.py` as part of the same service process.
+
+Default bind:
+- host: `0.0.0.0`
+- port: `4010`
+
+Optional startup overrides:
 
 ```bash
-. .venv/bin/activate
-python src/widget_server.py --host 0.0.0.0 --port 4010
+python src/main.py --widget-host 0.0.0.0 --widget-port 4010
 ```
 
-Widget route:
+Route:
 
 ```text
 GET /widgets/current-spicy-airports
+GET /api/weather/current?icao=EGMC
 ```
 
 Example:
 
 ```bash
 curl -sS http://localhost:4010/widgets/current-spicy-airports
+curl -sS "http://localhost:4010/api/weather/current?icao=EGMC"
 ```
+
+Current API route registry:
+- `GET /widgets/current-spicy-airports`
+- `GET /api/weather/current?icao=EGMC`
+
+Weather endpoint response shape:
+- `metar`
+- `wind` (`dir_degrees`, `speed_kt`, `gust_kt`)
+- `temp_c`
+- `visibility` (`meters`, `statute_mi`)
+- `cloud_layers` (`coverage`, `base_ft_agl`, `cloud_type`)
+- `current_runways` (`arrival`, `departure`, `in_use`, `sources`)
+- `flight_category`
+- `observed_at`
+- `pressure` (`hpa`, `in_hg`)
+- `precip`
+- `has_thunderstorm`
+- `has_snow`
+- `has_rain`
+- `has_fog`
+- `has_mist`
+- `wx_summary`
+
+Selection behavior summary:
+- picks one `airliner` and one `ga` airport from derived latest tables
+- day-state staged fallback per category: `day` -> `day/twilight` -> `any`
+- category-specific ranking (airliner vs ga)
+- GA applies a diversity preference against airliner primary condition
 
 Graceful shutdown:
 - Press `Ctrl+C` once to request a clean stop. The process exits after the current feed work finishes.
@@ -78,6 +117,7 @@ Graceful shutdown:
 - VATSIM AFV ATIS JSON: every 60s.
 - AviationWeather METAR cache CSV.GZ: every 10 minutes.
 - AviationWeather TAF cache XML.GZ: every 30 minutes.
+- AviationWeather international SIGMET JSON: every 20 minutes.
 - OurAirports CSV sync: checked hourly, downloads only when 7 days have elapsed since last successful sync.
 
 Skip logic:
@@ -111,12 +151,16 @@ The app enables:
   - `feed_state`
 - `aviationweather_metar`:
   - `metar_latest`
+  - `metar_history`
   - `feed_state`
 - `aviationweather_taf`:
   - `taf_latest`
   - `airport_weather_flags_latest` (refresh)
   - `airport_weather_score_latest` (refresh)
   - `airport_live_status_latest` (refresh)
+  - `feed_state`
+- `aviationweather_sigmet`:
+  - `sigmets`
   - `feed_state`
 - `ourairports_sync`:
   - `airport_reference_latest`
@@ -134,7 +178,9 @@ The app enables:
 - `vatsim_pilots_latest`: current pilot snapshot (latest only).
 - `vatsim_atis_latest`: current ATIS records.
 - `metar_latest`: latest METAR by ICAO.
+- `metar_history`: append-only METAR observations by ICAO and observation time.
 - `taf_latest`: latest TAF by ICAO.
+- `sigmets`: latest worldwide SIGMET advisories keyed by identifier.
 - `airport_reference_latest`: normalized airport metadata (ICAO, country/region/continent, lat/lon, type).
 - `airport_weather_flags_latest`: latest derived weather phenomenon/severity flags.
 - `airport_weather_score_latest`: latest derived weather challenge scores.
@@ -169,7 +215,9 @@ The app enables:
 sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS controllers FROM vatsim_controllers_latest;"
 sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS pilots FROM vatsim_pilots_latest;"
 sqlite3 data/aviation_hub.db "SELECT icao, wind_gust_kt, observation_time FROM metar_latest WHERE wind_gust_kt IS NOT NULL ORDER BY wind_gust_kt DESC LIMIT 10;"
+sqlite3 data/aviation_hub.db "SELECT icao, observation_time, wind_speed_kt, wind_gust_kt, altim_in_hg FROM metar_history WHERE icao='EGCC' ORDER BY observation_time DESC LIMIT 24;"
 sqlite3 data/aviation_hub.db "SELECT icao, issue_time, valid_from_time, valid_to_time FROM taf_latest ORDER BY issue_time DESC LIMIT 10;"
+sqlite3 data/aviation_hub.db "SELECT id, fir, hazard, valid_from, valid_to FROM sigmets ORDER BY valid_to DESC LIMIT 10;"
 sqlite3 data/aviation_hub.db "SELECT callsign, airport, atis_code, last_updated FROM vatsim_atis_latest ORDER BY last_updated DESC LIMIT 10;"
 sqlite3 data/aviation_hub.db "SELECT id, ts, type, entity, airport FROM events ORDER BY id DESC LIMIT 50;"
 sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS total_sessions, SUM(CASE WHEN is_active=1 THEN 1 ELSE 0 END) AS active_sessions FROM atc_sessions;"
@@ -235,6 +283,23 @@ ORDER BY overall_score DESC
 LIMIT 20;
 ```
 
+Recent METAR trend for one airport:
+
+```sql
+SELECT
+  observation_time,
+  wind_dir_degrees,
+  wind_speed_kt,
+  wind_gust_kt,
+  temp_c,
+  visibility_statute_mi,
+  altim_in_hg
+FROM metar_history
+WHERE icao = 'EGCC'
+ORDER BY observation_time DESC
+LIMIT 72;
+```
+
 Snow + ATC airports:
 
 ```sql
@@ -270,6 +335,13 @@ Each category object includes:
 - key metrics (`wind_gust_kt`, `visibility_meters`)
 - daylight preference fields (`day_state`, `is_daylight`)
 - computed rank (`spicy_rank`)
+- dominant condition hint (`primary_condition`)
+
+## Available HTTP endpoints
+
+Current read-only HTTP routes served by `src/main.py`:
+
+- `GET /widgets/current-spicy-airports`
 
 ## Backfill
 

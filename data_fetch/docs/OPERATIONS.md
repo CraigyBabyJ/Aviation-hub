@@ -31,12 +31,19 @@ journalctl -u aviation-hub.service -n 400 --no-pager | rg -i "error|exception|tr
 
 ## Widget endpoint
 
-Start widget server:
+The widget endpoint now runs inside the main `aviation-hub.service` process.
+
+Default bind:
+- `0.0.0.0:4010`
+
+No separate widget service is required.
+
+If you run manually, `src/main.py` starts both ingestor and widget server together:
 
 ```bash
 cd /home/craig/projects/Aviation-hub/data_fetch
 . .venv/bin/activate
-python src/widget_server.py --host 0.0.0.0 --port 4010
+python src/main.py --widget-host 0.0.0.0 --widget-port 4010
 ```
 
 Request widget JSON:
@@ -44,6 +51,29 @@ Request widget JSON:
 ```bash
 curl -sS http://localhost:4010/widgets/current-spicy-airports | jq .
 ```
+
+Request current weather JSON:
+
+```bash
+curl -sS "http://localhost:4010/api/weather/current?icao=EGMC" | jq .
+```
+
+Current HTTP routes:
+- `GET /widgets/current-spicy-airports`
+- `GET /api/weather/current?icao=EGMC`
+
+Widget notes:
+- returns one `airliner` and one `ga` pick
+- uses day-first fallback (`day` -> `day/twilight` -> `any`)
+- includes `primary_condition` and `spicy_rank` for display/debug
+
+Weather endpoint notes:
+- reads latest METAR from SQLite
+- returns normalized JSON for web/bot consumption
+- includes pressure in both `hpa` and `in_hg` when available
+- includes normalized condition fields from derived weather flags
+- includes parsed cloud layers from the raw METAR when present
+- includes ATIS-derived current runway usage when VATSIM ATIS is available
 
 ## Feed cadence (current)
 
@@ -69,6 +99,7 @@ sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS controllers FROM vatsim_control
 sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS pilots FROM vatsim_pilots_latest;"
 sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS atis FROM vatsim_atis_latest;"
 sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS metar FROM metar_latest;"
+sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS metar_history FROM metar_history;"
 sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS taf FROM taf_latest;"
 sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS live_status FROM airport_live_status_latest;"
 sqlite3 data/aviation_hub.db "SELECT COUNT(*) AS runways FROM airport_runways_latest;"
@@ -129,6 +160,12 @@ Snow + ATC airports:
 sqlite3 -header -column data/aviation_hub.db "SELECT airport, country, controller_count, overall_score FROM airport_live_status_latest WHERE has_snow=1 AND has_atc=1 ORDER BY overall_score DESC;"
 ```
 
+Recent METAR history for one airport:
+
+```bash
+sqlite3 -header -column data/aviation_hub.db "SELECT observation_time, wind_dir_degrees, wind_speed_kt, wind_gust_kt, temp_c, visibility_statute_mi, altim_in_hg FROM metar_history WHERE icao='EGCC' ORDER BY observation_time DESC LIMIT 48;"
+```
+
 ## Runway / suitability checks
 
 Suitability totals:
@@ -169,6 +206,7 @@ Notes:
 - `vatsim_network` -> controllers, pilots, ATC events, ATC sessions
 - `vatsim_atis` -> `vatsim_atis_latest`, `ATIS_CHANGED` events
 - `aviationweather_metar` -> `metar_latest`
+- `aviationweather_metar` -> `metar_latest`, `metar_history`
 - `aviationweather_taf` -> `taf_latest`
 - `ourairports_sync` -> local CSV files in `data/ourairports/`, `airport_reference_latest`, runway/suitability tables
 - `airport_live_status_latest` -> derived joined snapshot (airport metadata + ATC/ATIS + weather)

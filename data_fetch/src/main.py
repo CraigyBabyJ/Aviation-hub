@@ -7,6 +7,7 @@ import signal
 import sqlite3
 import time
 from dataclasses import dataclass
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from threading import Event
 
@@ -16,9 +17,11 @@ from db import get_connection, init_db, update_feed_state
 from fetchers.atis import FEED_NAME as ATIS_FEED, process_atis
 from fetchers.metar import FEED_NAME as METAR_FEED, process_metar
 from fetchers.ourairports import FEED_NAME as OURAIRPORTS_FEED, process_ourairports
+from fetchers.sigmet import FEED_NAME as SIGMET_FEED, process_sigmet
 from fetchers.taf import FEED_NAME as TAF_FEED, process_taf
 from fetchers.vatsim import FEED_NAME as VATSIM_FEED, next_poll_seconds, process_vatsim_network
 from util import configure_logging, utc_now_iso
+from widget_server import start_widget_server
 
 LOGGER = logging.getLogger("aviation_hub.main")
 STOP_EVENT = Event()
@@ -95,6 +98,19 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
             )
 
         try:
+            LOGGER.info("Checking %s", SIGMET_FEED)
+            process_sigmet(conn, session)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("SIGMET processing failed: %s", exc)
+            update_feed_state(
+                conn,
+                feed_name=SIGMET_FEED,
+                last_fetch=utc_now_iso(),
+                last_error=str(exc),
+                last_error_at=utc_now_iso(),
+            )
+
+        try:
             LOGGER.info("Checking %s", OURAIRPORTS_FEED)
             process_ourairports(conn, session)
         except Exception as exc:  # noqa: BLE001
@@ -114,6 +130,7 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
         ATIS_FEED: PollState(interval=60, next_run=0.0),
         METAR_FEED: PollState(interval=600, next_run=0.0),
         TAF_FEED: PollState(interval=1800, next_run=0.0),
+        SIGMET_FEED: PollState(interval=1200, next_run=0.0),
         OURAIRPORTS_FEED: PollState(interval=3600, next_run=0.0),
     }
 
@@ -201,6 +218,26 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
                 )
             polls[TAF_FEED].next_run = now + polls[TAF_FEED].interval
 
+        if now >= polls[SIGMET_FEED].next_run:
+            try:
+                LOGGER.info("Checking %s", SIGMET_FEED)
+                process_sigmet(conn, session)
+                LOGGER.info(
+                    "%s check complete; next check in %ss",
+                    SIGMET_FEED,
+                    polls[SIGMET_FEED].interval,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("SIGMET processing failed: %s", exc)
+                update_feed_state(
+                    conn,
+                    feed_name=SIGMET_FEED,
+                    last_fetch=utc_now_iso(),
+                    last_error=str(exc),
+                    last_error_at=utc_now_iso(),
+                )
+            polls[SIGMET_FEED].next_run = now + polls[SIGMET_FEED].interval
+
         if now >= polls[OURAIRPORTS_FEED].next_run:
             try:
                 LOGGER.info("Checking %s", OURAIRPORTS_FEED)
@@ -231,6 +268,8 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Aviation Hub data ingestor")
     parser.add_argument("--once", action="store_true", help="Run each feed once and exit")
+    parser.add_argument("--widget-host", default="0.0.0.0", help="Widget HTTP bind host")
+    parser.add_argument("--widget-port", type=int, default=4010, help="Widget HTTP bind port")
     return parser.parse_args()
 
 
@@ -249,12 +288,22 @@ def main() -> int:
             LOGGER.error("Another ingestor instance is already running; exiting")
             return 1
 
+        widget_server: ThreadingHTTPServer | None = None
+        if not args.once:
+            try:
+                widget_server = start_widget_server(host=args.widget_host, port=args.widget_port)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("Widget HTTP server failed to start: %s", exc)
+
         with get_connection() as conn:
             init_db(conn)
             with requests.Session() as session:
                 session.headers.update({"User-Agent": "aviation-hub/1.0"})
                 exit_code = run_cycle(conn, session, once=args.once)
             conn.execute("PRAGMA wal_checkpoint(FULL);")
+            if widget_server is not None:
+                widget_server.shutdown()
+                widget_server.server_close()
             return exit_code
 
 

@@ -118,6 +118,28 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_metar_observation_time
             ON metar_latest (observation_time);
 
+        CREATE TABLE IF NOT EXISTS metar_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            icao TEXT NOT NULL,
+            observation_time TEXT NOT NULL,
+            raw_text TEXT,
+            latitude REAL,
+            longitude REAL,
+            temp_c REAL,
+            dewpoint_c REAL,
+            wind_dir_degrees INTEGER,
+            wind_speed_kt INTEGER,
+            wind_gust_kt INTEGER,
+            visibility_statute_mi REAL,
+            altim_in_hg REAL,
+            fetched_at TEXT NOT NULL,
+            UNIQUE (icao, observation_time)
+        );
+        CREATE INDEX IF NOT EXISTS idx_metar_history_icao_obs
+            ON metar_history (icao, observation_time DESC);
+        CREATE INDEX IF NOT EXISTS idx_metar_history_obs
+            ON metar_history (observation_time DESC);
+
         CREATE TABLE IF NOT EXISTS taf_latest (
             icao TEXT PRIMARY KEY,
             issue_time TEXT,
@@ -132,6 +154,31 @@ def init_db(conn: sqlite3.Connection) -> None:
             ON taf_latest (issue_time);
         CREATE INDEX IF NOT EXISTS idx_taf_valid_to_time
             ON taf_latest (valid_to_time);
+
+        CREATE TABLE IF NOT EXISTS sigmets (
+            id TEXT PRIMARY KEY,
+            fir TEXT,
+            fir_name TEXT,
+            hazard TEXT,
+            qualifier TEXT,
+            base INTEGER,
+            top INTEGER,
+            movement_dir INTEGER,
+            movement_speed INTEGER,
+            valid_from TEXT,
+            valid_to TEXT,
+            raw_text TEXT,
+            geometry TEXT,
+            fetched_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_sigmets_fir
+            ON sigmets (fir);
+        CREATE INDEX IF NOT EXISTS idx_sigmets_hazard
+            ON sigmets (hazard);
+        CREATE INDEX IF NOT EXISTS idx_sigmets_valid_from
+            ON sigmets (valid_from);
+        CREATE INDEX IF NOT EXISTS idx_sigmets_valid_to
+            ON sigmets (valid_to);
 
         CREATE TABLE IF NOT EXISTS airport_reference_latest (
             icao TEXT PRIMARY KEY,
