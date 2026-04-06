@@ -6,34 +6,42 @@ It also performs a built-in weekly OurAirports dataset sync to `data/ourairports
 ## Project layout
 
 ```text
-data_fetch/
-├── data/
-├── sql/
-│   └── migrations/
-│       └── 003_vatsim_events_and_bookings.sql
-├── scripts/
-│   └── backfill_atc_sessions.py
-├── requirements.txt
-├── src/
-│   ├── db.py
-│   ├── main.py
-│   ├── util.py
-│   ├── widget_server.py
-│   └── fetchers/
-│       ├── airport_live_status.py
-│       ├── atis.py
-│       ├── ingest_vatsim_atc_bookings.py
-│       ├── ingest_vatsim_events.py
-│       ├── metar.py
-│       ├── ourairports.py
-│       ├── sigmet.py
-│       ├── runway_enrichment.py
-│       ├── taf.py
-│       ├── vatsim_schedule_utils.py
-│       └── vatsim.py
-└── systemd/
-    └── aviation-hub.service
+Aviation-hub/
+├── discord_bot/                    # optional Discord slash bot (calls widget HTTP API)
+│   ├── bot.py
+│   └── requirements.txt
+└── data_fetch/
+    ├── data/
+    ├── sql/
+    │   └── migrations/
+    │       └── 003_vatsim_events_and_bookings.sql
+    ├── scripts/
+    │   └── backfill_atc_sessions.py
+    ├── requirements.txt
+    ├── src/
+    │   ├── db.py
+    │   ├── main.py
+    │   ├── util.py
+    │   ├── widget_server.py
+    │   └── fetchers/
+    │       ├── airport_live_status.py
+    │       ├── atis.py
+    │       ├── ingest_vatsim_atc_bookings.py
+    │       ├── ingest_vatsim_events.py
+    │       ├── metar.py
+    │       ├── ourairports.py
+    │       ├── sigmet.py
+    │       ├── runway_enrichment.py
+    │       ├── taf.py
+    │       ├── vatsim_schedule_utils.py
+    │       └── vatsim.py
+    └── systemd/
+        └── aviation-hub.service
 ```
+
+## External APIs and third-party sites
+
+All outbound ingest URLs, optional env overrides, and notes on sites such as [StatSim](https://statsim.net/) (no stable public API for us to call) are documented in **`docs/EXTERNAL_DATA_SOURCES.md`**.
 
 ## Setup
 
@@ -394,9 +402,119 @@ Each category object includes:
 
 ## Available HTTP endpoints
 
-Current read-only HTTP routes served by `src/main.py`:
+Read-only JSON from the widget thread in `src/main.py` (or `python src/widget_server.py`). Base URL example: `http://127.0.0.1:4010`.
+
+### Airport (grouped under `/api/airport/…`)
+
+| Method | Path | Notes |
+|--------|------|--------|
+| GET | `/api/airport/status?icao=ICAO` | Full live-status row + controllers (4-char ICAO). |
+| GET | `/api/airport/summary?icao=ICAO&hours=H` | **Light dashboard row:** ATC count, `weather_flags`, `spicy` score/level, `upcoming_signals` (bookings + events counts in `[now, now+H]`). Default **`hours=24`**, max **168**. |
+| GET | `/api/airport/brief?icao=ICAO&bookings_limit=N` | Heavy “everything” bundle: weather, spicy, VATSIM, bookings, inbounds sample. |
+| GET | `/api/airport/vatsim?icao=CODE` | Live VATSIM controllers + ATIS (**canonical**; 3–4 char code). |
+| GET | `/api/vatsim/airport?icao=CODE` | **Legacy alias** — same handler as `/api/airport/vatsim`. |
+
+### Busy soon (multi-airport)
+
+| Method | Path | Notes |
+|--------|------|--------|
+| GET | `/api/airports/upcoming?hours=H&limit=N` | Airports ranked by heuristic **`busyness_score = bookings + 2 × events`** over `[now, now+H]` from ingested **bookings** + **events**. Default **`hours=6`**, max **168**; **`limit`** default **50**, max **200**. Bookings are advisory. |
+| GET | `/api/airports/ranked?hours=H&limit=N&include_unmanned=…` | Airports ordered by **`rank_score`**: prefers **manned** (live ATC from `airport_live_status_latest`), then **controllers**, **filed inbounds**, **upcoming** bookings/events (same window as `/upcoming`), plus **weather `overall_score`**. Query **`include_unmanned`**: `true`/`false`/`1`/`0` (default **true**); when **false**, only airports with live ATC. Same **`hours`** / **`limit`** defaults and caps as `/upcoming`. |
+
+### Weather & station
+
+- `GET /api/weather/current?icao=ICAO`
+- `GET /api/metar?icao=ICAO`
+- `GET /api/taf?icao=ICAO`
+- `GET /api/station?icao=ICAO`
+- `GET /api/atis?icao=ICAO`
+
+### VATSIM data (namespace kept for events/bookings/inbounds)
+
+- `GET /api/vatsim/events?limit=N&days=D` — default `days=30`, `days=0` = no start upper bound; `limit` default **100**, max **400**.
+- `GET /api/vatsim/bookings?limit=N&icao=ICAO`
+- `GET /api/vatsim/inbounds?icao=ICAO&limit=N` — online pilots with filed arrival; default `limit=200`, max `500`.
+- `GET /api/vatsim/lookup?q=…` — **Unified lookup** from the live snapshot: online **pilot** (flight callsign), **controller** (e.g. `EGLL_TWR`), or **airport** (3–4 letter ICAO → same payload as `/api/airport/vatsim`). Parameter **`q`** or **`callsign`** (alias); 2–20 chars, `[A-Z0-9_]`. If the query contains `_`, only pilot/controller are tried (no airport ICAO fallback). **`404`** if nothing matches.
+
+### Widget
 
 - `GET /widgets/current-spicy-airports`
+
+### Quick “product” map (for UIs)
+
+| Use case | Endpoint |
+|----------|-----------|
+| Airport lookup (full) | `/api/airport/brief` |
+| Airport row for lists / tiles | `/api/airport/summary` |
+| Weather | `/api/weather/current` |
+| “Where should I fly?” (spicy picks) | `/widgets/current-spicy-airports` |
+| Events | `/api/vatsim/events` |
+| ATC online + ATIS | `/api/airport/vatsim` |
+| Pilot / ATC callsign or airport ICAO | `/api/vatsim/lookup` |
+| Busy in the next few hours | `/api/airports/upcoming` |
+| Manned + how busy (ATC, inbounds, upcoming, weather) | `/api/airports/ranked` |
+
+**`/api/airports/ranked`** is the combined “manned first + activity” view; **`/api/airports/upcoming`** is bookings/events only.
+
+Future composition (e.g. “best airport **right now**”, “best in **3 hours**”, hardest landing): combine **`/widgets/current-spicy-airports`** or **`/api/airport/summary`** with **`/api/airports/upcoming`** or **`/api/airports/ranked`** and weather flags; external integrations (e.g. landing challenges) can consume the same JSON.
+
+## Discord bot (optional)
+
+The repo includes `../discord_bot/bot.py`, a small **slash-command** client that calls the widget HTTP API above (so run the ingestor + widget on `AVIATION_HUB_BASE_URL`, default `http://127.0.0.1:4010`).
+
+```bash
+cd ../discord_bot
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+export DISCORD_BOT_TOKEN='your bot token'   # Bot → Token (not Application ID / Public Key)
+# optional: export DISCORD_GUILD_ID='1234567890'  # faster slash-command sync while testing
+python bot.py
+```
+
+Portal: **Public Key** is not used (gateway bot). **Application ID** is optional: with `DISCORD_APPLICATION_ID` (or `DISCORD_CLIENT_ID`), `/info` can show a default **add-bot** OAuth link when `AVBOT_ADD_BOT_URL` is unset. Only the **bot token** is required. See `discord_bot/.env.example`; keep secrets in `discord_bot/.env` (gitignored).
+
+Slash commands (after `bot.py` syncs to Discord, **`/help`** lists the same descriptions live):
+
+| Command | Purpose |
+|---------|---------|
+| `/airport` | Full airport brief (weather, VATSIM, bookings, inbounds sample) → `/api/airport/brief` |
+| `/bookings` | VATSIM ATC bookings → `/api/vatsim/bookings` |
+| `/events` | VATSIM events → `/api/vatsim/events` |
+| `/help` | Every command name + description (from the command tree) |
+| `/inbounds` | Pilots filed to an ICAO → `/api/vatsim/inbounds` |
+| `/info` | About AvBot; add-bot + support links from env |
+| `/metar` | Raw METAR → `/api/metar` |
+| `/ping` | Discord gateway latency (websocket RTT) |
+| `/ranked` | Airports by manned ATC + busyness → `/api/airports/ranked` |
+| `/spicy` | Spicy-airports widget → `/widgets/current-spicy-airports` |
+| `/summary` | Light airport row → `/api/airport/summary` |
+| `/upcoming` | Airports busy soon (bookings + events) → `/api/airports/upcoming` |
+| `/vatsim` | Pilot callsign, ATC callsign, or airport ICAO → `/api/vatsim/lookup` |
+| `/weather` | METAR + summary → `/api/weather/current` |
+
+### systemd on Ubuntu (service `aviation-hub-bot`)
+
+Unit files live under `discord_bot/systemd/`. They load **`discord_bot/.env`** (`KEY=value` lines, no `export`; at minimum `DISCORD_BOT_TOKEN=`). Create the venv first (`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt` in `discord_bot/`).
+
+**System service:** the shipped unit runs as Linux user **`craig`** with paths under **`/home/craig/projects/Aviation-hub`**. Change `User`/`Group`/`WorkingDirectory`/`ExecStart`/`EnvironmentFile` only if your account or clone location differs.
+
+```bash
+sudo cp discord_bot/systemd/aviation-hub-bot.service /etc/systemd/system/aviation-hub-bot.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now aviation-hub-bot
+journalctl -u aviation-hub-bot -f   # logs
+```
+
+**User service (no sudo; survives logout only if lingering is on):**
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp discord_bot/systemd/aviation-hub-bot.user.service ~/.config/systemd/user/aviation-hub-bot.service
+systemctl --user daemon-reload
+systemctl --user enable --now aviation-hub-bot
+loginctl enable-linger "$USER"   # optional: start at boot without an interactive login
+journalctl --user -u aviation-hub-bot -f
+```
 
 ## Backfill
 
@@ -415,16 +533,18 @@ Notes:
 
 ## Troubleshooting
 
-Check service status:
+Check **ingestor** service status (`aviation-hub`) and **Discord bot** (`aviation-hub-bot`):
 
 ```bash
 systemctl status aviation-hub.service --no-pager -l
+systemctl status aviation-hub-bot.service --no-pager -l
 ```
 
 Tail logs:
 
 ```bash
 journalctl -u aviation-hub.service -f
+journalctl -u aviation-hub-bot.service -f
 ```
 
 Check per-feed health:
@@ -439,15 +559,15 @@ Check event throughput:
 sqlite3 data/aviation_hub.db "SELECT type, COUNT(*) FROM events GROUP BY type ORDER BY 2 DESC;"
 ```
 
-## systemd service
+## systemd: data_fetch ingestor (`aviation-hub`)
 
-1. Edit `systemd/aviation-hub.service`:
-   - Set `User=` to your account (default should be your current user).
-   - Replace `/path/to/data_fetch` in `WorkingDirectory` and `ExecStart`.
+The template `data_fetch/systemd/aviation-hub.service` is preset for user **`craig`** and **`/home/craig/projects/Aviation-hub/data_fetch`**. Adjust only if your layout differs.
+
+1. Ensure `.venv` exists under `data_fetch/` and `main.py` runs as that user.
 2. Install and start:
 
 ```bash
-sudo cp systemd/aviation-hub.service /etc/systemd/system/aviation-hub.service
+sudo cp data_fetch/systemd/aviation-hub.service /etc/systemd/system/aviation-hub.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now aviation-hub
 ```

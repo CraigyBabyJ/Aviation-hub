@@ -1,0 +1,19 @@
+# Paths assume user craig and repo at /home/craig/projects/Aviation-hub (user units run as you).
+[Unit]
+Description=Aviation Hub Discord bot (AvBot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/craig/projects/Aviation-hub/discord_bot
+ExecStart=/home/craig/projects/Aviation-hub/discord_bot/.venv/bin/python /home/craig/projects/Aviation-hub/discord_bot/bot.py
+Restart=on-failure
+RestartSec=15
+EnvironmentFile=-/home/craig/projects/Aviation-hub/discord_bot/.env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aviation-hub-bot
+
+[Install]
+WantedBy=default.target

@@ -7,7 +7,7 @@ import math
 import re
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,7 +26,16 @@ TAF_PATH = "/api/taf"
 STATION_PATH = "/api/station"
 ATIS_PATH = "/api/atis"
 AIRPORT_STATUS_PATH = "/api/airport/status"
+AIRPORT_VATSIM_PATH = "/api/airport/vatsim"
+AIRPORT_SUMMARY_PATH = "/api/airport/summary"
+AIRPORTS_UPCOMING_PATH = "/api/airports/upcoming"
+AIRPORTS_RANKED_PATH = "/api/airports/ranked"
 VATSIM_AIRPORT_PATH = "/api/vatsim/airport"
+VATSIM_EVENTS_PATH = "/api/vatsim/events"
+VATSIM_BOOKINGS_PATH = "/api/vatsim/bookings"
+VATSIM_INBOUNDS_PATH = "/api/vatsim/inbounds"
+VATSIM_LOOKUP_PATH = "/api/vatsim/lookup"
+AIRPORT_BRIEF_PATH = "/api/airport/brief"
 HTTP_ROUTES = {
     "current_spicy_airports": WIDGET_PATH,
     "weather_current": WEATHER_CURRENT_PATH,
@@ -35,7 +44,16 @@ HTTP_ROUTES = {
     "station": STATION_PATH,
     "atis": ATIS_PATH,
     "airport_status": AIRPORT_STATUS_PATH,
+    "airport_vatsim": AIRPORT_VATSIM_PATH,
+    "airport_summary": AIRPORT_SUMMARY_PATH,
+    "airports_upcoming": AIRPORTS_UPCOMING_PATH,
+    "airports_ranked": AIRPORTS_RANKED_PATH,
     "vatsim_airport": VATSIM_AIRPORT_PATH,
+    "vatsim_events": VATSIM_EVENTS_PATH,
+    "vatsim_bookings": VATSIM_BOOKINGS_PATH,
+    "vatsim_inbounds": VATSIM_INBOUNDS_PATH,
+    "vatsim_lookup": VATSIM_LOOKUP_PATH,
+    "airport_brief": AIRPORT_BRIEF_PATH,
 }
 
 # VATSIM controller facility codes (see VATSIM API / network documentation).
@@ -417,6 +435,111 @@ def _parse_vatsim_airport_icao_query(query: str) -> tuple[str | None, str | None
     return icao, None
 
 
+def _parse_vatsim_lookup_query(query: str) -> tuple[str | None, str | None]:
+    """`q` or `callsign`: VATSIM pilot/ATC callsign or 3–4 letter ICAO (letters/digits/underscore)."""
+    params = parse_qs(query)
+    raw = (params.get("q", [""])[0] or params.get("callsign", [""])[0] or "").strip()
+    if not raw:
+        return None, "q_required"
+    q = raw.upper()
+    if len(q) < 2 or len(q) > 20:
+        return None, "invalid_query_length"
+    if not re.match(r"^[A-Z0-9_]+$", q):
+        return None, "invalid_query_chars"
+    return q, None
+
+
+def _parse_optional_icao_from_query(query: str) -> tuple[str | None, str | None]:
+    """Optional `icao` for filters; error only if present but invalid."""
+    params = parse_qs(query)
+    icao = (params.get("icao", [""])[0] or "").strip().upper()
+    if not icao:
+        return None, None
+    if len(icao) != 4 or not icao.isalnum():
+        return None, "invalid_icao"
+    return icao, None
+
+
+def _parse_limit_from_query(query: str, *, default: int, max_limit: int) -> int:
+    params = parse_qs(query)
+    raw = (params.get("limit", [""])[0] or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(1, min(max_limit, value))
+
+
+def _parse_bookings_limit_from_query(query: str, *, default: int = 15, max_limit: int = 25) -> int:
+    params = parse_qs(query)
+    raw = (params.get("bookings_limit", [""])[0] or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(1, min(max_limit, value))
+
+
+def _parse_bool_query(query: str, name: str, *, default: bool = True) -> bool:
+    params = parse_qs(query)
+    raw = (params.get(name, [""])[0] or "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _parse_hours_from_query(query: str, *, default: int, max_hours: int) -> int:
+    params = parse_qs(query)
+    raw = (params.get("hours", [""])[0] or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(1, min(max_hours, value))
+
+
+def _utc_window_markers_hours(hours: int) -> tuple[str, str]:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    end = now + timedelta(hours=hours)
+    return (
+        now.isoformat().replace("+00:00", "Z"),
+        end.isoformat().replace("+00:00", "Z"),
+    )
+
+
+def _parse_days_ahead_from_query(
+    query: str,
+    *,
+    default: int = 30,
+    max_days: int = 366,
+) -> int | None:
+    """
+    `days` = number of days from now for the start-time upper bound (inclusive window).
+    `days=0` or negative means no upper bound (all future-ending events, subject to `limit`).
+    """
+    params = parse_qs(query)
+    raw = (params.get("days", [""])[0] or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value <= 0:
+        return None
+    return max(1, min(max_days, value))
+
+
 def _normalize_runway_ident(ident: str | None) -> str | None:
     token = (ident or "").strip().upper()
     return token or None
@@ -669,6 +792,354 @@ def build_vatsim_airport_payload(conn: sqlite3.Connection, icao: str) -> dict[st
     }
 
 
+def _vatsim_pilot_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "callsign": row["callsign"],
+        "cid": row["cid"],
+        "name": row["name"],
+        "server": row["server"],
+        "pilot_rating": row["pilot_rating"],
+        "latitude": row["latitude"],
+        "longitude": row["longitude"],
+        "altitude": row["altitude"],
+        "groundspeed": row["groundspeed"],
+        "transponder": row["transponder"],
+        "heading": row["heading"],
+        "flight_plan_aircraft": row["flight_plan_aircraft"],
+        "flight_plan_departure": row["flight_plan_departure"],
+        "flight_plan_arrival": row["flight_plan_arrival"],
+        "flight_plan_altitude": row["flight_plan_altitude"],
+        "flight_plan_rules": row["flight_plan_rules"],
+        "logon_time": row["logon_time"],
+        "last_updated": row["last_updated"],
+    }
+
+
+def _vatsim_controller_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    fac = row["facility"]
+    return {
+        "callsign": row["callsign"],
+        "cid": row["cid"],
+        "name": row["name"],
+        "facility": fac,
+        "facility_label": _facility_label(fac),
+        "frequency": row["frequency"],
+        "rating": row["rating"],
+        "latitude": row["latitude"],
+        "longitude": row["longitude"],
+        "altitude": row["altitude"],
+        "server": row["server"],
+        "visual_range": row["visual_range"],
+        "logon_time": row["logon_time"],
+        "last_updated": row["last_updated"],
+    }
+
+
+def build_vatsim_lookup_payload(conn: sqlite3.Connection, q: str) -> dict[str, Any]:
+    """
+    Resolve one VATSIM entity from the hub snapshot: online pilot, online controller, or airport
+    (controllers + ATIS for ICAO). Order depends on query shape (underscore → no airport fallback).
+    """
+    fetched_at = utc_now_iso()
+
+    def row_pilot() -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT
+                callsign, cid, name, server, pilot_rating, latitude, longitude, altitude,
+                groundspeed, transponder, heading, flight_plan_aircraft, flight_plan_departure,
+                flight_plan_arrival, flight_plan_altitude, flight_plan_rules, logon_time, last_updated
+            FROM vatsim_pilots_latest
+            WHERE UPPER(TRIM(callsign)) = ?
+            """,
+            (q,),
+        ).fetchone()
+
+    def row_controller() -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT
+                callsign, cid, name, facility, rating, frequency, latitude, longitude, altitude,
+                server, visual_range, logon_time, last_updated
+            FROM vatsim_controllers_latest
+            WHERE UPPER(TRIM(callsign)) = ?
+            """,
+            (q,),
+        ).fetchone()
+
+    if "_" in q:
+        pr = row_pilot()
+        if pr is not None:
+            return {"kind": "pilot", "pilot": _vatsim_pilot_row_to_dict(pr), "fetched_at": fetched_at}
+        cr = row_controller()
+        if cr is not None:
+            return {"kind": "controller", "controller": _vatsim_controller_row_to_dict(cr), "fetched_at": fetched_at}
+        return {"kind": "not_found", "query": q}
+
+    if 3 <= len(q) <= 4 and q.isalnum():
+        pr = row_pilot()
+        if pr is not None:
+            return {"kind": "pilot", "pilot": _vatsim_pilot_row_to_dict(pr), "fetched_at": fetched_at}
+        cr = row_controller()
+        if cr is not None:
+            return {"kind": "controller", "controller": _vatsim_controller_row_to_dict(cr), "fetched_at": fetched_at}
+        ap = build_vatsim_airport_payload(conn, q)
+        ap["kind"] = "airport"
+        return ap
+
+    pr = row_pilot()
+    if pr is not None:
+        return {"kind": "pilot", "pilot": _vatsim_pilot_row_to_dict(pr), "fetched_at": fetched_at}
+    cr = row_controller()
+    if cr is not None:
+        return {"kind": "controller", "controller": _vatsim_controller_row_to_dict(cr), "fetched_at": fetched_at}
+    return {"kind": "not_found", "query": q}
+
+
+def build_vatsim_inbounds_payload(
+    conn: sqlite3.Connection,
+    icao: str,
+    *,
+    limit: int,
+) -> dict[str, Any]:
+    """
+    Pilots currently on VATSIM whose filed flight plan arrival matches the given ICAO.
+
+    Source: `vatsim_pilots_latest` (network snapshot only; disconnecting removes the row).
+    Match: case-insensitive trim on `flight_plan_arrival`.
+    """
+    rows = conn.execute(
+        """
+        SELECT
+            callsign,
+            cid,
+            name,
+            server,
+            pilot_rating,
+            latitude,
+            longitude,
+            altitude,
+            groundspeed,
+            transponder,
+            heading,
+            flight_plan_aircraft,
+            flight_plan_departure,
+            flight_plan_arrival,
+            flight_plan_altitude,
+            flight_plan_rules,
+            logon_time,
+            last_updated
+        FROM vatsim_pilots_latest
+        WHERE UPPER(TRIM(COALESCE(flight_plan_arrival, ''))) = ?
+        ORDER BY callsign ASC
+        LIMIT ?
+        """,
+        (icao.upper().strip(), limit),
+    ).fetchall()
+
+    pilots: list[dict[str, Any]] = []
+    for row in rows:
+        pilots.append(
+            {
+                "callsign": row["callsign"],
+                "cid": row["cid"],
+                "name": row["name"],
+                "server": row["server"],
+                "pilot_rating": row["pilot_rating"],
+                "latitude": row["latitude"],
+                "longitude": row["longitude"],
+                "altitude": row["altitude"],
+                "groundspeed": row["groundspeed"],
+                "transponder": row["transponder"],
+                "heading": row["heading"],
+                "flight_plan_aircraft": row["flight_plan_aircraft"],
+                "flight_plan_departure": row["flight_plan_departure"],
+                "flight_plan_arrival": row["flight_plan_arrival"],
+                "flight_plan_altitude": row["flight_plan_altitude"],
+                "flight_plan_rules": row["flight_plan_rules"],
+                "logon_time": row["logon_time"],
+                "last_updated": row["last_updated"],
+            }
+        )
+
+    return {
+        "icao": icao.upper().strip(),
+        "source": "vatsim_pilots_latest",
+        "generated_at": utc_now_iso(),
+        "match_field": "flight_plan_arrival",
+        "note": "Online pilots only, from the latest VATSIM network snapshot ingested locally.",
+        "count": len(pilots),
+        "limit_applied": limit,
+        "pilots": pilots,
+    }
+
+
+def build_vatsim_events_list_payload(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    days_ahead: int | None = 30,
+) -> dict[str, Any]:
+    """
+    VATSIM published events from `vatsim_events_latest` (ingested snapshot).
+
+    Overlap rule: event is included if it has not ended yet (`end_time_utc >= now`) and, when
+    `days_ahead` is set, its start is on or before `now + days_ahead` (events starting later are
+    excluded). Use `days_ahead=None` for no upper bound on start time.
+    """
+    now_marker = utc_now_iso().replace("+00:00", "Z")
+    window_end_marker: str | None = None
+    if days_ahead is not None:
+        window_end = datetime.now(timezone.utc) + timedelta(days=days_ahead)
+        window_end_marker = window_end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    if window_end_marker is None:
+        rows = conn.execute(
+            """
+            SELECT
+                event_id,
+                name,
+                event_type,
+                start_time_utc,
+                end_time_utc,
+                short_description,
+                link_url,
+                airports_json,
+                fetched_at_utc
+            FROM vatsim_events_latest
+            WHERE end_time_utc >= ?
+            ORDER BY start_time_utc ASC
+            LIMIT ?
+            """,
+            (now_marker, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT
+                event_id,
+                name,
+                event_type,
+                start_time_utc,
+                end_time_utc,
+                short_description,
+                link_url,
+                airports_json,
+                fetched_at_utc
+            FROM vatsim_events_latest
+            WHERE end_time_utc >= ?
+              AND start_time_utc <= ?
+            ORDER BY start_time_utc ASC
+            LIMIT ?
+            """,
+            (now_marker, window_end_marker, limit),
+        ).fetchall()
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        events.append(
+            {
+                "event_id": row["event_id"],
+                "name": row["name"],
+                "event_type": row["event_type"],
+                "start_time_utc": row["start_time_utc"],
+                "end_time_utc": row["end_time_utc"],
+                "short_description": row["short_description"],
+                "link_url": row["link_url"],
+                "airports_json": row["airports_json"],
+            }
+        )
+    return {
+        "source": "vatsim_events",
+        "generated_at": utc_now_iso(),
+        "snapshot_fetched_at": rows[0]["fetched_at_utc"] if rows else None,
+        "days_ahead": days_ahead,
+        "window_start_utc": now_marker,
+        "window_end_utc": window_end_marker,
+        "count": len(events),
+        "events": events,
+    }
+
+
+def build_vatsim_bookings_list_payload(
+    conn: sqlite3.Connection,
+    *,
+    icao: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    """Scheduled ATC bookings from `vatsim_atc_bookings_latest` (advisory; not live coverage)."""
+    now_marker = utc_now_iso().replace("+00:00", "Z")
+    if icao:
+        rows = conn.execute(
+            """
+            SELECT
+                booking_id,
+                callsign,
+                airport_icao,
+                fir_icao,
+                position_type,
+                starts_at_utc,
+                ends_at_utc,
+                booking_type,
+                controller_cid,
+                fetched_at_utc
+            FROM vatsim_atc_bookings_latest
+            WHERE ends_at_utc >= ?
+              AND (
+                    UPPER(TRIM(airport_icao)) = ?
+                 OR UPPER(callsign) LIKE ?
+              )
+            ORDER BY starts_at_utc ASC
+            LIMIT ?
+            """,
+            (now_marker, icao, f"{icao}_%", limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT
+                booking_id,
+                callsign,
+                airport_icao,
+                fir_icao,
+                position_type,
+                starts_at_utc,
+                ends_at_utc,
+                booking_type,
+                controller_cid,
+                fetched_at_utc
+            FROM vatsim_atc_bookings_latest
+            WHERE ends_at_utc >= ?
+            ORDER BY starts_at_utc ASC
+            LIMIT ?
+            """,
+            (now_marker, limit),
+        ).fetchall()
+
+    bookings: list[dict[str, Any]] = []
+    for row in rows:
+        bookings.append(
+            {
+                "booking_id": row["booking_id"],
+                "callsign": row["callsign"],
+                "airport_icao": row["airport_icao"],
+                "fir_icao": row["fir_icao"],
+                "position_type": row["position_type"],
+                "starts_at_utc": row["starts_at_utc"],
+                "ends_at_utc": row["ends_at_utc"],
+                "booking_type": row["booking_type"],
+                "controller_cid": row["controller_cid"],
+            }
+        )
+    return {
+        "source": "vatsim_bookings",
+        "generated_at": utc_now_iso(),
+        "icao_filter": icao,
+        "snapshot_fetched_at": rows[0]["fetched_at_utc"] if rows else None,
+        "count": len(bookings),
+        "bookings": bookings,
+    }
+
+
 def _load_runway_reference(conn: sqlite3.Connection, icao: str, ident: str) -> dict[str, Any] | None:
     row = conn.execute(
         """
@@ -815,6 +1286,387 @@ def build_current_weather_payload(conn: sqlite3.Connection, icao: str) -> dict[s
     }
 
 
+def build_airport_brief_payload(
+    conn: sqlite3.Connection,
+    icao: str,
+    *,
+    bookings_limit: int = 15,
+) -> dict[str, Any]:
+    """
+    One-call snapshot for an airport: current weather (METAR + flags), derived “spicy” live row,
+    live VATSIM controllers/ATIS, and upcoming advisory bookings.
+    """
+    weather = build_current_weather_payload(conn, icao)
+    vatsim = build_vatsim_airport_payload(conn, icao)
+    status = build_airport_status_payload(conn, icao)
+    spicy: dict[str, Any] | None = None
+    if status:
+        spicy = {
+            "overall_score": status["overall_score"],
+            "challenge_level": status["challenge_level"],
+            "flight_category": status["flight_category"],
+            "wx_summary": status["wx_summary"],
+            "has_atc": status["has_atc"],
+            "controller_count": status["controller_count"],
+            "has_atis": status["has_atis"],
+        }
+
+    bookings_block: dict[str, Any] = {
+        "advisory": "Scheduled bookings only; not guaranteed online coverage.",
+        "count": 0,
+        "items": [],
+        "snapshot_fetched_at": None,
+    }
+    try:
+        bk = build_vatsim_bookings_list_payload(conn, icao=icao, limit=bookings_limit)
+        bookings_block["count"] = bk["count"]
+        bookings_block["items"] = bk["bookings"]
+        bookings_block["snapshot_fetched_at"] = bk.get("snapshot_fetched_at")
+    except sqlite3.OperationalError as exc:
+        LOGGER.warning("airport brief: bookings unavailable: %s", exc)
+        bookings_block["error"] = "bookings_table_unavailable"
+
+    inbounds_block: dict[str, Any] = {}
+    try:
+        ib = build_vatsim_inbounds_payload(conn, icao, limit=80)
+        cap = 35
+        plist = ib["pilots"]
+        inbounds_block = {
+            "count": ib["count"],
+            "match_field": ib["match_field"],
+            "note": ib["note"],
+            "pilots_sample": plist[:cap],
+            "truncated": len(plist) > cap,
+            "full_list_url_hint": f"/api/vatsim/inbounds?icao={icao}",
+        }
+    except sqlite3.OperationalError as exc:
+        LOGGER.warning("airport brief: inbounds unavailable: %s", exc)
+        inbounds_block = {"error": "pilots_table_unavailable"}
+
+    return {
+        "icao": icao,
+        "generated_at": utc_now_iso(),
+        "weather": weather,
+        "spicy": spicy,
+        "vatsim": vatsim,
+        "bookings": bookings_block,
+        "inbounds": inbounds_block,
+    }
+
+
+def build_airport_summary_payload(
+    conn: sqlite3.Connection,
+    icao: str,
+    *,
+    signal_hours: int = 24,
+) -> dict[str, Any]:
+    """
+    Lightweight row for dashboards: ATC count, weather flags, spicy score, upcoming bookings/events counts.
+    `signal_hours` bounds the “upcoming” booking/event overlap window (default 24h).
+    """
+    icao_u = icao.upper().strip()
+    now_m, win_end = _utc_window_markers_hours(signal_hours)
+    row = conn.execute(
+        "SELECT * FROM airport_live_status_latest WHERE airport = ?",
+        (icao_u,),
+    ).fetchone()
+    has_row = row is not None
+    if has_row:
+        atc_count = int(row["controller_count"] or 0)
+    else:
+        r2 = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM vatsim_controllers_latest
+            WHERE facility IS NOT NULL AND facility > 0 AND callsign LIKE ?
+            """,
+            (f"{icao_u}_%",),
+        ).fetchone()
+        atc_count = int(r2["c"] if r2 else 0)
+
+    weather_flags: dict[str, Any] | None = None
+    spicy: dict[str, Any] | None = None
+    if has_row:
+        weather_flags = {
+            "has_snow": bool(row["has_snow"]),
+            "has_rain": bool(row["has_rain"]),
+            "has_thunderstorm": bool(row["has_thunderstorm"]),
+            "has_freezing_precip": bool(row["has_freezing_precip"]),
+            "has_fog": bool(row["has_fog"]),
+            "has_mist": bool(row["has_mist"]),
+            "is_low_visibility": bool(row["is_low_visibility"]),
+            "is_low_ceiling": bool(row["is_low_ceiling"]),
+            "is_gusty": bool(row["is_gusty"]),
+        }
+        spicy = {
+            "overall_score": row["overall_score"],
+            "challenge_level": row["challenge_level"],
+            "flight_category": row["flight_category"],
+        }
+
+    events_count: int | None = 0
+    try:
+        er = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM vatsim_events_latest AS e
+            WHERE e.end_time_utc >= ?
+              AND e.start_time_utc <= ?
+              AND e.airports_json IS NOT NULL
+              AND json_valid(e.airports_json)
+              AND json_type(e.airports_json) = 'array'
+              AND EXISTS (
+                SELECT 1 FROM json_each(e.airports_json) AS je
+                WHERE LENGTH(TRIM(je.value)) = 4
+                  AND UPPER(TRIM(je.value)) = ?
+              )
+            """,
+            (now_m, win_end, icao_u),
+        ).fetchone()
+        events_count = int(er["c"] if er else 0)
+    except sqlite3.OperationalError:
+        events_count = None
+
+    bookings_count: int | None = 0
+    try:
+        br = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM vatsim_atc_bookings_latest
+            WHERE ends_at_utc >= ?
+              AND starts_at_utc <= ?
+              AND (
+                UPPER(TRIM(COALESCE(airport_icao, ''))) = ?
+                OR UPPER(callsign) LIKE ?
+              )
+            """,
+            (now_m, win_end, icao_u, f"{icao_u}_%"),
+        ).fetchone()
+        bookings_count = int(br["c"] if br else 0)
+    except sqlite3.OperationalError:
+        bookings_count = None
+
+    return {
+        "icao": icao_u,
+        "generated_at": utc_now_iso(),
+        "signal_window_hours": signal_hours,
+        "window_start_utc": now_m,
+        "window_end_utc": win_end,
+        "atc": {
+            "controller_count": atc_count,
+            "has_atc": atc_count > 0,
+            "has_live_status_row": has_row,
+        },
+        "weather_flags": weather_flags,
+        "spicy": spicy,
+        "upcoming_signals": {
+            "bookings_count": bookings_count,
+            "events_count": events_count,
+            "has_bookings": (bookings_count > 0) if bookings_count is not None else None,
+            "has_events": (events_count > 0) if events_count is not None else None,
+        },
+    }
+
+
+def _airport_upcoming_scores(conn: sqlite3.Connection, hours: int) -> tuple[dict[str, dict[str, int]], str, str]:
+    """Bookings + events overlap counts per ICAO for [now, now+hours]. Returns (scores, now_m, win_end)."""
+    now_m, win_end = _utc_window_markers_hours(hours)
+    scores: dict[str, dict[str, int]] = {}
+
+    def ensure(ap: str) -> dict[str, int]:
+        ap = ap.strip().upper()
+        if ap not in scores:
+            scores[ap] = {"bookings": 0, "events": 0}
+        return scores[ap]
+
+    try:
+        b_rows = conn.execute(
+            """
+            SELECT airport_icao, callsign
+            FROM vatsim_atc_bookings_latest
+            WHERE ends_at_utc >= ? AND starts_at_utc <= ?
+            """,
+            (now_m, win_end),
+        ).fetchall()
+        for r in b_rows:
+            ap_raw = r["airport_icao"]
+            if ap_raw and str(ap_raw).strip():
+                ap = str(ap_raw).strip().upper()
+                if len(ap) == 4 and ap.isalnum():
+                    ensure(ap)["bookings"] += 1
+                    continue
+            cs = (r["callsign"] or "").strip().upper()
+            if "_" in cs:
+                prefix = cs.split("_", 1)[0]
+                if len(prefix) == 4 and prefix.isalpha():
+                    ensure(prefix)["bookings"] += 1
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        e_rows = conn.execute(
+            """
+            SELECT UPPER(TRIM(je.value)) AS ap, COUNT(DISTINCT e.event_id) AS c
+            FROM vatsim_events_latest AS e
+            CROSS JOIN json_each(e.airports_json) AS je
+            WHERE e.end_time_utc >= ?
+              AND e.start_time_utc <= ?
+              AND e.airports_json IS NOT NULL
+              AND json_valid(e.airports_json)
+              AND json_type(e.airports_json) = 'array'
+              AND LENGTH(TRIM(je.value)) = 4
+            GROUP BY 1
+            """,
+            (now_m, win_end),
+        ).fetchall()
+        for er in e_rows:
+            ap = (er["ap"] or "").strip().upper()
+            if len(ap) == 4 and ap.isalpha():
+                ensure(ap)["events"] = int(er["c"] or 0)
+    except sqlite3.OperationalError:
+        pass
+
+    return scores, now_m, win_end
+
+
+def build_airports_upcoming_payload(
+    conn: sqlite3.Connection,
+    *,
+    hours: int,
+    limit: int,
+) -> dict[str, Any]:
+    """
+    Rank airports likely to be “busy soon” from ingested bookings + events in a forward window.
+    `busyness_score` = bookings + 2 * distinct_events (heuristic).
+    """
+    scores, now_m, win_end = _airport_upcoming_scores(conn, hours)
+    ranked_list: list[dict[str, Any]] = []
+    for ap, parts in scores.items():
+        b = parts["bookings"]
+        ev = parts["events"]
+        ranked_list.append(
+            {
+                "airport": ap,
+                "bookings": b,
+                "events": ev,
+                "busyness_score": b + 2 * ev,
+            }
+        )
+    ranked_list.sort(key=lambda x: (-x["busyness_score"], x["airport"]))
+    top = ranked_list[:limit]
+
+    return {
+        "generated_at": utc_now_iso(),
+        "hours": hours,
+        "window_start_utc": now_m,
+        "window_end_utc": win_end,
+        "note": "Heuristic from ingested bookings + events; bookings are advisory; overlap window [now, now+hours].",
+        "count": len(top),
+        "airports": top,
+    }
+
+
+def build_airports_ranked_payload(
+    conn: sqlite3.Connection,
+    *,
+    hours: int,
+    limit: int,
+    include_unmanned: bool = True,
+) -> dict[str, Any]:
+    """
+    Ordered list: manned (live ATC) vs not, then how “busy” (controllers, filed inbounds, upcoming
+    bookings/events, weather challenge score). Heuristic `rank_score` for dashboards.
+    """
+    upcoming, now_m, win_end = _airport_upcoming_scores(conn, hours)
+
+    live_by_ap: dict[str, sqlite3.Row] = {}
+    try:
+        for row in conn.execute(
+            """
+            SELECT airport, controller_count, has_atc, has_atis,
+                   overall_score, challenge_level, country
+            FROM airport_live_status_latest
+            WHERE COALESCE(controller_count, 0) > 0 OR COALESCE(has_atc, 0) != 0
+            """
+        ):
+            live_by_ap[row["airport"]] = row
+    except sqlite3.OperationalError:
+        pass
+
+    inb: dict[str, int] = {}
+    try:
+        for row in conn.execute(
+            """
+            SELECT UPPER(TRIM(flight_plan_arrival)) AS ap, COUNT(*) AS c
+            FROM vatsim_pilots_latest
+            WHERE COALESCE(TRIM(flight_plan_arrival), '') != ''
+            GROUP BY 1
+            """
+        ):
+            ap = (row["ap"] or "").strip().upper()
+            if len(ap) == 4 and ap.isalpha():
+                inb[ap] = int(row["c"] or 0)
+    except sqlite3.OperationalError:
+        pass
+
+    all_aps = set(live_by_ap.keys()) | set(upcoming.keys()) | set(inb.keys())
+    rows_out: list[dict[str, Any]] = []
+    for ap in sorted(all_aps):
+        lr = live_by_ap.get(ap)
+        cc = int(lr["controller_count"] or 0) if lr is not None else 0
+        ha = bool(lr["has_atc"]) if lr is not None else False
+        manned = cc > 0 or ha
+        if not include_unmanned and not manned:
+            continue
+
+        up = upcoming.get(ap, {"bookings": 0, "events": 0})
+        b, ev = up["bookings"], up["events"]
+        upcoming_score = b + 2 * ev
+        ib = inb.get(ap, 0)
+        os = float(lr["overall_score"] or 0) if lr is not None else 0.0
+
+        rank_score = (
+            (100_000.0 if manned else 0.0)
+            + 500.0 * min(cc, 20)
+            + 50.0 * min(ib, 50)
+            + 10.0 * upcoming_score
+            + os
+        )
+
+        rows_out.append(
+            {
+                "airport": ap,
+                "manned": manned,
+                "controller_count": cc,
+                "has_atis": bool(lr["has_atis"]) if lr is not None else False,
+                "inbounds": ib,
+                "upcoming_bookings": b,
+                "upcoming_events": ev,
+                "upcoming_score": upcoming_score,
+                "overall_score": float(lr["overall_score"]) if lr is not None and lr["overall_score"] is not None else None,
+                "challenge_level": lr["challenge_level"] if lr is not None else None,
+                "country": lr["country"] if lr is not None else None,
+                "rank_score": round(rank_score, 2),
+            }
+        )
+
+    rows_out.sort(key=lambda x: (-x["rank_score"], x["airport"]))
+    top = rows_out[:limit]
+
+    return {
+        "generated_at": utc_now_iso(),
+        "hours": hours,
+        "window_start_utc": now_m,
+        "window_end_utc": win_end,
+        "include_unmanned": include_unmanned,
+        "note": (
+            "rank_score = 100k if manned + 500*controllers + 50*inbounds + 10*upcoming_score + "
+            "weather overall_score; upcoming uses bookings+events in window; bookings advisory."
+        ),
+        "count": len(top),
+        "airports": top,
+    }
+
+
 class WidgetHandler(BaseHTTPRequestHandler):
     db_path: Path = DB_PATH
 
@@ -842,8 +1694,35 @@ class WidgetHandler(BaseHTTPRequestHandler):
             if parsed.path == AIRPORT_STATUS_PATH:
                 self._handle_airport_status(parsed.query)
                 return
+            if parsed.path == AIRPORT_SUMMARY_PATH:
+                self._handle_airport_summary(parsed.query)
+                return
+            if parsed.path == AIRPORT_VATSIM_PATH:
+                self._handle_vatsim_airport(parsed.query)
+                return
             if parsed.path == VATSIM_AIRPORT_PATH:
                 self._handle_vatsim_airport(parsed.query)
+                return
+            if parsed.path == AIRPORTS_UPCOMING_PATH:
+                self._handle_airports_upcoming(parsed.query)
+                return
+            if parsed.path == AIRPORTS_RANKED_PATH:
+                self._handle_airports_ranked(parsed.query)
+                return
+            if parsed.path == VATSIM_EVENTS_PATH:
+                self._handle_vatsim_events(parsed.query)
+                return
+            if parsed.path == VATSIM_BOOKINGS_PATH:
+                self._handle_vatsim_bookings(parsed.query)
+                return
+            if parsed.path == VATSIM_INBOUNDS_PATH:
+                self._handle_vatsim_inbounds(parsed.query)
+                return
+            if parsed.path == VATSIM_LOOKUP_PATH:
+                self._handle_vatsim_lookup(parsed.query)
+                return
+            if parsed.path == AIRPORT_BRIEF_PATH:
+                self._handle_airport_brief(parsed.query)
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except Exception as exc:  # noqa: BLE001
@@ -935,6 +1814,57 @@ class WidgetHandler(BaseHTTPRequestHandler):
             return
         self._send_json(HTTPStatus.OK, payload)
 
+    def _handle_airport_summary(self, query: str) -> None:
+        icao, error = _parse_icao_from_query(query)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        hours = _parse_hours_from_query(query, default=24, max_hours=168)
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                payload = build_airport_summary_payload(conn, icao, signal_hours=hours)
+            self._send_json(HTTPStatus.OK, payload)
+        except sqlite3.OperationalError as exc:
+            LOGGER.warning("airport summary API: %s", exc)
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "summary_unavailable", "detail": str(exc)},
+            )
+
+    def _handle_airports_upcoming(self, query: str) -> None:
+        hours = _parse_hours_from_query(query, default=6, max_hours=168)
+        limit = _parse_limit_from_query(query, default=50, max_limit=200)
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                payload = build_airports_upcoming_payload(conn, hours=hours, limit=limit)
+            self._send_json(HTTPStatus.OK, payload)
+        except sqlite3.OperationalError as exc:
+            LOGGER.warning("airports upcoming API: %s", exc)
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "upcoming_unavailable", "detail": str(exc)},
+            )
+
+    def _handle_airports_ranked(self, query: str) -> None:
+        hours = _parse_hours_from_query(query, default=6, max_hours=168)
+        limit = _parse_limit_from_query(query, default=50, max_limit=200)
+        include_unmanned = _parse_bool_query(query, "include_unmanned", default=True)
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                payload = build_airports_ranked_payload(
+                    conn,
+                    hours=hours,
+                    limit=limit,
+                    include_unmanned=include_unmanned,
+                )
+            self._send_json(HTTPStatus.OK, payload)
+        except sqlite3.OperationalError as exc:
+            LOGGER.warning("airports ranked API: %s", exc)
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "ranked_unavailable", "detail": str(exc)},
+            )
+
     def _handle_vatsim_airport(self, query: str) -> None:
         icao, error = _parse_vatsim_airport_icao_query(query)
         if error:
@@ -943,6 +1873,91 @@ class WidgetHandler(BaseHTTPRequestHandler):
         with _open_readonly_connection(self.db_path) as conn:
             payload = build_vatsim_airport_payload(conn, icao)
         self._send_json(HTTPStatus.OK, payload)
+
+    def _handle_vatsim_events(self, query: str) -> None:
+        days = _parse_days_ahead_from_query(query, default=30, max_days=366)
+        limit = _parse_limit_from_query(query, default=100, max_limit=400)
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                payload = build_vatsim_events_list_payload(conn, limit=limit, days_ahead=days)
+            self._send_json(HTTPStatus.OK, payload)
+        except sqlite3.OperationalError as exc:
+            LOGGER.warning("vatsim events API: %s", exc)
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "events_table_unavailable", "detail": str(exc)},
+            )
+
+    def _handle_vatsim_bookings(self, query: str) -> None:
+        icao, err = _parse_optional_icao_from_query(query)
+        if err:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": err})
+            return
+        limit = _parse_limit_from_query(query, default=25, max_limit=100)
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                payload = build_vatsim_bookings_list_payload(conn, icao=icao, limit=limit)
+            self._send_json(HTTPStatus.OK, payload)
+        except sqlite3.OperationalError as exc:
+            LOGGER.warning("vatsim bookings API: %s", exc)
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "bookings_table_unavailable", "detail": str(exc)},
+            )
+
+    def _handle_vatsim_inbounds(self, query: str) -> None:
+        icao, error = _parse_icao_from_query(query)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        limit = _parse_limit_from_query(query, default=200, max_limit=500)
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                payload = build_vatsim_inbounds_payload(conn, icao, limit=limit)
+            self._send_json(HTTPStatus.OK, payload)
+        except sqlite3.OperationalError as exc:
+            LOGGER.warning("vatsim inbounds API: %s", exc)
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "pilots_table_unavailable", "detail": str(exc)},
+            )
+
+    def _handle_vatsim_lookup(self, query: str) -> None:
+        q, err = _parse_vatsim_lookup_query(query)
+        if err:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": err})
+            return
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                payload = build_vatsim_lookup_payload(conn, q)
+        except sqlite3.OperationalError as exc:
+            LOGGER.warning("vatsim lookup API: %s", exc)
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "lookup_unavailable", "detail": str(exc)},
+            )
+            return
+        if payload.get("kind") == "not_found":
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found", "query": q})
+            return
+        self._send_json(HTTPStatus.OK, payload)
+
+    def _handle_airport_brief(self, query: str) -> None:
+        icao, error = _parse_icao_from_query(query)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        bk_limit = _parse_bookings_limit_from_query(query, default=15, max_limit=25)
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                payload = build_airport_brief_payload(conn, icao, bookings_limit=bk_limit)
+            self._send_json(HTTPStatus.OK, payload)
+        except sqlite3.OperationalError as exc:
+            LOGGER.warning("airport brief API: %s", exc)
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "brief_unavailable", "detail": str(exc)},
+            )
 
     def log_message(self, fmt: str, *args: object) -> None:
         LOGGER.info("widget_http %s", fmt % args)

@@ -1,0 +1,27 @@
+[Unit]
+Description=Aviation Hub Discord bot (AvBot)
+Documentation=file:///home/craig/projects/Aviation-hub/data_fetch/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Linux account for this host (paths below assume /home/craig/projects/Aviation-hub).
+User=craig
+Group=craig
+WorkingDirectory=/home/craig/projects/Aviation-hub/discord_bot
+
+# Requires a venv:  cd discord_bot && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+ExecStart=/home/craig/projects/Aviation-hub/discord_bot/.venv/bin/python /home/craig/projects/Aviation-hub/discord_bot/bot.py
+
+Restart=on-failure
+RestartSec=15
+# Load DISCORD_BOT_TOKEN, AVIATION_HUB_BASE_URL, etc. (KEY=value lines, no "export")
+EnvironmentFile=-/home/craig/projects/Aviation-hub/discord_bot/.env
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aviation-hub-bot
+
+[Install]
+WantedBy=multi-user.target

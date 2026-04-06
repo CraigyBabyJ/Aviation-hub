@@ -1,2 +1,6 @@
 data_fetch/data/aviation_hub.db-shm
 data_fetch/data/aviation_hub.db-wal
+
+# Local Discord secrets
+discord_bot/.env
+discord_bot/.venv/

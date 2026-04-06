@@ -5,10 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=CHANGE_ME
-WorkingDirectory=/path/to/data_fetch
+User=craig
+Group=craig
+WorkingDirectory=/home/craig/projects/Aviation-hub/data_fetch
 # Optional: Environment="VATSIM_BOOKINGS_API_KEY=..." or EnvironmentFile=-/etc/aviation-hub.env
-ExecStart=/path/to/data_fetch/.venv/bin/python /path/to/data_fetch/src/main.py
+ExecStart=/home/craig/projects/Aviation-hub/data_fetch/.venv/bin/python /home/craig/projects/Aviation-hub/data_fetch/src/main.py
 Restart=always
 RestartSec=5
 StandardOutput=journal
