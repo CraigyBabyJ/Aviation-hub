@@ -38,6 +38,18 @@ from discord.ext import commands
 LOG = logging.getLogger("aviation_hub.discord")
 
 
+def _normalize_discord_bot_token(raw: str | None) -> str:
+    """Strip whitespace and optional surrounding quotes (common in .env / copy-paste)."""
+    if not raw:
+        return ""
+    t = raw.strip()
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in ("'", '"'):
+        t = t[1:-1].strip()
+    if t.lower().startswith("bot "):
+        t = t[4:].strip()
+    return t
+
+
 def _hub_base() -> str:
     return os.environ.get("AVIATION_HUB_BASE_URL", "http://127.0.0.1:4010").rstrip("/")
 
@@ -879,12 +891,20 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
-    token = os.environ.get("DISCORD_BOT_TOKEN")
-    if not token or not token.strip():
+    token = _normalize_discord_bot_token(os.environ.get("DISCORD_BOT_TOKEN"))
+    if not token:
         LOG.error("Set DISCORD_BOT_TOKEN to your Discord bot token.")
         return 1
     try:
-        bot.run(token.strip())
+        bot.run(token)
+    except discord.LoginFailure as exc:
+        LOG.error(
+            "Discord rejected the token (%s). Use **Bot → Token** in the Developer Portal, not the "
+            "OAuth2 **Client Secret**. In discord_bot/.env use `DISCORD_BOT_TOKEN=...` with **no** quotes; "
+            "if you reset the token, paste the new value and `sudo systemctl restart aviation-hub-bot`.",
+            exc,
+        )
+        return 1
     except Exception:
         LOG.exception("Bot crashed")
         return 1
