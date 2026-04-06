@@ -70,6 +70,29 @@ def normalize_iso_utc(value: str | None) -> str | None:
     return parsed.isoformat().replace("+00:00", "Z")
 
 
+def normalize_vatsim_api_time(value: Any) -> str | None:
+    """Parse ISO-8601 or 'YYYY-MM-DD HH:MM:SS' (assumed UTC) from VATSIM-style APIs."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            parsed = datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+        return parsed.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    text = str(value).strip()
+    if not text:
+        return None
+    iso = normalize_iso_utc(text)
+    if iso:
+        return iso
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return parsed.isoformat().replace("+00:00", "Z")
+
+
 def json_dumps_compact(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), ensure_ascii=True, sort_keys=True)
 

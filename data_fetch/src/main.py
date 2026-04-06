@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import logging
+import os
 import signal
 import sqlite3
 import time
@@ -19,6 +20,11 @@ from fetchers.metar import FEED_NAME as METAR_FEED, process_metar
 from fetchers.ourairports import FEED_NAME as OURAIRPORTS_FEED, process_ourairports
 from fetchers.sigmet import FEED_NAME as SIGMET_FEED, process_sigmet
 from fetchers.taf import FEED_NAME as TAF_FEED, process_taf
+from fetchers.ingest_vatsim_atc_bookings import (
+    FEED_NAME as VATSIM_BOOKINGS_FEED,
+    process_vatsim_atc_bookings,
+)
+from fetchers.ingest_vatsim_events import FEED_NAME as VATSIM_EVENTS_FEED, process_vatsim_events
 from fetchers.vatsim import FEED_NAME as VATSIM_FEED, next_poll_seconds, process_vatsim_network
 from util import configure_logging, utc_now_iso
 from widget_server import start_widget_server
@@ -26,6 +32,17 @@ from widget_server import start_widget_server
 LOGGER = logging.getLogger("aviation_hub.main")
 STOP_EVENT = Event()
 LOCK_PATH = Path(__file__).resolve().parent.parent / "data" / "ingestor.lock"
+
+
+def _env_poll_seconds(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return max(30, int(str(raw).strip()))
+    except ValueError:
+        LOGGER.warning("Invalid integer for %s=%r; using default %s", name, raw, default)
+        return default
 
 
 def _request_shutdown(signum: int, _frame: object) -> None:
@@ -111,6 +128,32 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
             )
 
         try:
+            LOGGER.info("Checking %s", VATSIM_EVENTS_FEED)
+            process_vatsim_events(conn, session)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("VATSIM events processing failed: %s", exc)
+            update_feed_state(
+                conn,
+                feed_name=VATSIM_EVENTS_FEED,
+                last_fetch=utc_now_iso(),
+                last_error=str(exc),
+                last_error_at=utc_now_iso(),
+            )
+
+        try:
+            LOGGER.info("Checking %s", VATSIM_BOOKINGS_FEED)
+            process_vatsim_atc_bookings(conn, session)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("VATSIM ATC bookings processing failed: %s", exc)
+            update_feed_state(
+                conn,
+                feed_name=VATSIM_BOOKINGS_FEED,
+                last_fetch=utc_now_iso(),
+                last_error=str(exc),
+                last_error_at=utc_now_iso(),
+            )
+
+        try:
             LOGGER.info("Checking %s", OURAIRPORTS_FEED)
             process_ourairports(conn, session)
         except Exception as exc:  # noqa: BLE001
@@ -131,6 +174,14 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
         METAR_FEED: PollState(interval=600, next_run=0.0),
         TAF_FEED: PollState(interval=1800, next_run=0.0),
         SIGMET_FEED: PollState(interval=1200, next_run=0.0),
+        VATSIM_EVENTS_FEED: PollState(
+            interval=_env_poll_seconds("VATSIM_EVENTS_POLL_SECONDS", 900),
+            next_run=0.0,
+        ),
+        VATSIM_BOOKINGS_FEED: PollState(
+            interval=_env_poll_seconds("VATSIM_BOOKINGS_POLL_SECONDS", 300),
+            next_run=0.0,
+        ),
         OURAIRPORTS_FEED: PollState(interval=3600, next_run=0.0),
     }
 
@@ -237,6 +288,46 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
                     last_error_at=utc_now_iso(),
                 )
             polls[SIGMET_FEED].next_run = now + polls[SIGMET_FEED].interval
+
+        if now >= polls[VATSIM_EVENTS_FEED].next_run:
+            try:
+                LOGGER.info("Checking %s", VATSIM_EVENTS_FEED)
+                process_vatsim_events(conn, session)
+                LOGGER.info(
+                    "%s check complete; next check in %ss",
+                    VATSIM_EVENTS_FEED,
+                    polls[VATSIM_EVENTS_FEED].interval,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("VATSIM events processing failed: %s", exc)
+                update_feed_state(
+                    conn,
+                    feed_name=VATSIM_EVENTS_FEED,
+                    last_fetch=utc_now_iso(),
+                    last_error=str(exc),
+                    last_error_at=utc_now_iso(),
+                )
+            polls[VATSIM_EVENTS_FEED].next_run = now + polls[VATSIM_EVENTS_FEED].interval
+
+        if now >= polls[VATSIM_BOOKINGS_FEED].next_run:
+            try:
+                LOGGER.info("Checking %s", VATSIM_BOOKINGS_FEED)
+                process_vatsim_atc_bookings(conn, session)
+                LOGGER.info(
+                    "%s check complete; next check in %ss",
+                    VATSIM_BOOKINGS_FEED,
+                    polls[VATSIM_BOOKINGS_FEED].interval,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("VATSIM ATC bookings processing failed: %s", exc)
+                update_feed_state(
+                    conn,
+                    feed_name=VATSIM_BOOKINGS_FEED,
+                    last_fetch=utc_now_iso(),
+                    last_error=str(exc),
+                    last_error_at=utc_now_iso(),
+                )
+            polls[VATSIM_BOOKINGS_FEED].next_run = now + polls[VATSIM_BOOKINGS_FEED].interval
 
         if now >= polls[OURAIRPORTS_FEED].next_run:
             try:

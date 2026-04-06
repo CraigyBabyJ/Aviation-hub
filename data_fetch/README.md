@@ -8,6 +8,9 @@ It also performs a built-in weekly OurAirports dataset sync to `data/ourairports
 ```text
 data_fetch/
 ├── data/
+├── sql/
+│   └── migrations/
+│       └── 003_vatsim_events_and_bookings.sql
 ├── scripts/
 │   └── backfill_atc_sessions.py
 ├── requirements.txt
@@ -19,11 +22,14 @@ data_fetch/
 │   └── fetchers/
 │       ├── airport_live_status.py
 │       ├── atis.py
+│       ├── ingest_vatsim_atc_bookings.py
+│       ├── ingest_vatsim_events.py
 │       ├── metar.py
 │       ├── ourairports.py
 │       ├── sigmet.py
 │       ├── runway_enrichment.py
 │       ├── taf.py
+│       ├── vatsim_schedule_utils.py
 │       └── vatsim.py
 └── systemd/
     └── aviation-hub.service
@@ -119,6 +125,44 @@ Graceful shutdown:
 - AviationWeather TAF cache XML.GZ: every 30 minutes.
 - AviationWeather international SIGMET JSON: every 20 minutes.
 - OurAirports CSV sync: checked hourly, downloads only when 7 days have elapsed since last successful sync.
+- VATSIM public events JSON: default every 15 minutes (`VATSIM_EVENTS_POLL_SECONDS`, default `900`).
+- VATSIM ATC bookings JSON: default every 5 minutes (`VATSIM_BOOKINGS_POLL_SECONDS`, default `300`).
+
+### VATSIM events vs ATC bookings (scheduled / advisory)
+
+| Feed | Table | Meaning |
+|------|--------|--------|
+| `vatsim_events` | `vatsim_events_latest` | **Future / current published events** from the public VATSIM Events API (not live network positions). |
+| `vatsim_atc_bookings` | `vatsim_atc_bookings_latest` | **Scheduled controller bookings** from the VATSIM ATC Bookings API. **Advisory only**—voluntary sign-ups, not a guarantee anyone will connect. |
+
+**Configuration (environment variables)**
+
+| Variable | Default | Notes |
+|----------|---------|--------|
+| `VATSIM_EVENTS_ENABLED` | `true` | Set to `false` to skip the events feed entirely. |
+| `VATSIM_BOOKINGS_ENABLED` | `true` | Set to `false` to skip bookings entirely. |
+| `VATSIM_EVENTS_URL` | `https://events.vatsim.net/v1/latest` | Override if VATSIM changes host or API version; confirm with [VATSIM Events API docs](https://vatsim.dev/api/events-api). |
+| `VATSIM_BOOKINGS_URL` | `https://atc-bookings.vatsim.net/api/booking` | List endpoint; trailing slashes are trimmed. |
+| `VATSIM_BOOKINGS_API_KEY` | _(empty)_ | Optional **Bearer** token. The public `GET /api/booking` list works **without** a key; set this if you need authenticated access (e.g. filtered or `key_only` queries per [API docs](https://atc-bookings.vatsim.net/api-doc)). |
+| `VATSIM_EVENTS_POLL_SECONDS` | `900` | Minimum clamp `30`. |
+| `VATSIM_BOOKINGS_POLL_SECONDS` | `300` | Minimum clamp `30`. |
+
+**Assumptions**
+
+- Events API responses are either a top-level JSON array or an object containing a `data` / `events`-style array; unknown fields remain recoverable from `raw_json`.
+- Booking payloads match the published bookings API (array of objects with `id`, `callsign`, `start`, `end`, etc.); timestamp strings without a timezone are interpreted as **UTC**.
+- The default events hostname must resolve in your environment; if not, set `VATSIM_EVENTS_URL` to the current official URL from VATSIM.
+
+**SQLite helpers (views)**
+
+- `airports_with_upcoming_events` — ICAO codes from `airports_json` for events that have not yet ended (UTC `strftime` window).
+- `airports_with_booked_atc_next_6h` — booked **airport** positions (rows with `airport_icao` set) overlapping the next six hours from “now” in SQLite UTC.
+
+Existing databases can apply the same DDL with:
+
+```bash
+sqlite3 data/aviation_hub.db < sql/migrations/003_vatsim_events_and_bookings.sql
+```
 
 Skip logic:
 - VATSIM network updates only when `general.update_timestamp` changes.
@@ -170,6 +214,14 @@ The app enables:
   - `airport_live_status_latest` (refresh)
   - local files under `data/ourairports/`
   - `feed_state`
+- `vatsim_events`:
+  - `vatsim_events_latest`
+  - views `airports_with_upcoming_events`
+  - `feed_state`
+- `vatsim_atc_bookings`:
+  - `vatsim_atc_bookings_latest`
+  - view `airports_with_booked_atc_next_6h`
+  - `feed_state`
 
 ## Table reference
 
@@ -191,6 +243,9 @@ The app enables:
 - `events`: append-only event stream (`ATC_ONLINE`, `ATC_OFFLINE`, `ATIS_CHANGED`).
 - `atc_seen`: internal state used to detect online/offline transitions.
 - `atc_sessions`: historical ATC sessions for analytics.
+- `vatsim_events_latest`: latest snapshot of published VATSIM events (`raw_json` retains the full event object for re-parsing).
+- `vatsim_atc_bookings_latest`: latest snapshot of ATC bookings (`raw_json` per row).
+- `airports_with_upcoming_events` / `airports_with_booked_atc_next_6h`: read-only views for airport-centric widgets (see section above).
 
 `atc_sessions` fields:
 - `callsign`, `airport`, `facility`, `frequency`, `name`, `cid`, `logon_time`
