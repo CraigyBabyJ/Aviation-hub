@@ -21,10 +21,43 @@ from util import configure_logging, utc_now_iso
 LOGGER = logging.getLogger("aviation_hub.widget")
 WIDGET_PATH = "/widgets/current-spicy-airports"
 WEATHER_CURRENT_PATH = "/api/weather/current"
+METAR_PATH = "/api/metar"
+TAF_PATH = "/api/taf"
+STATION_PATH = "/api/station"
+ATIS_PATH = "/api/atis"
+AIRPORT_STATUS_PATH = "/api/airport/status"
+VATSIM_AIRPORT_PATH = "/api/vatsim/airport"
 HTTP_ROUTES = {
     "current_spicy_airports": WIDGET_PATH,
     "weather_current": WEATHER_CURRENT_PATH,
+    "metar": METAR_PATH,
+    "taf": TAF_PATH,
+    "station": STATION_PATH,
+    "atis": ATIS_PATH,
+    "airport_status": AIRPORT_STATUS_PATH,
+    "vatsim_airport": VATSIM_AIRPORT_PATH,
 }
+
+# VATSIM controller facility codes (see VATSIM API / network documentation).
+_FACILITY_LABELS: dict[int, str] = {
+    0: "OBS",
+    1: "FSS",
+    2: "DEL",
+    3: "GND",
+    4: "TWR",
+    5: "APP",
+    6: "CTR",
+}
+
+
+def _facility_label(facility: object) -> str:
+    if facility is None or facility == "":
+        return "ATC"
+    try:
+        key = int(facility)
+    except (TypeError, ValueError):
+        return "ATC"
+    return _FACILITY_LABELS.get(key, f"Facility {key}")
 _METAR_CLOUD_LAYER_RE = re.compile(
     r"(?<!\S)(FEW|SCT|BKN|OVC|VV|///)(\d{3}|///)(CB|TCU|///)?(?!\S)"
 )
@@ -363,6 +396,27 @@ def _parse_cloud_layers(raw_text: str | None) -> list[dict[str, Any]]:
     return layers
 
 
+def _parse_icao_from_query(query: str) -> tuple[str | None, str | None]:
+    params = parse_qs(query)
+    icao = (params.get("icao", [""])[0] or "").strip().upper()
+    if not icao:
+        return None, "icao_required"
+    if len(icao) != 4 or not icao.isalnum():
+        return None, "invalid_icao"
+    return icao, None
+
+
+def _parse_vatsim_airport_icao_query(query: str) -> tuple[str | None, str | None]:
+    """ICAO for VATSIM airport scope: 3–4 alphanumeric (matches station / BML airport codes)."""
+    params = parse_qs(query)
+    icao = (params.get("icao", [""])[0] or "").strip().upper()
+    if not icao:
+        return None, "icao_required"
+    if len(icao) < 3 or len(icao) > 4 or not icao.isalnum():
+        return None, "invalid_icao"
+    return icao, None
+
+
 def _normalize_runway_ident(ident: str | None) -> str | None:
     token = (ident or "").strip().upper()
     return token or None
@@ -409,6 +463,209 @@ def _parse_runways_from_atis_text(text: str | None) -> dict[str, list[str]]:
         "arrival": arrival,
         "departure": departure,
         "in_use": in_use,
+    }
+
+
+def build_metar_payload(conn: sqlite3.Connection, icao: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT icao, observation_time, raw_text
+        FROM metar_latest
+        WHERE icao = ?
+        """,
+        (icao,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "icao": row["icao"],
+        "observation_time": row["observation_time"],
+        "raw_text": row["raw_text"],
+    }
+
+
+def build_taf_payload(conn: sqlite3.Connection, icao: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT icao, issue_time, valid_from_time, valid_to_time, raw_text
+        FROM taf_latest
+        WHERE icao = ?
+        """,
+        (icao,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "icao": row["icao"],
+        "issue_time": row["issue_time"],
+        "valid_from_time": row["valid_from_time"],
+        "valid_to_time": row["valid_to_time"],
+        "raw_text": row["raw_text"],
+    }
+
+
+def build_station_payload(conn: sqlite3.Connection, icao: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT icao, iata, name, country, region, municipality,
+               latitude_deg, longitude_deg, elevation_ft, type
+        FROM airport_reference_latest
+        WHERE icao = ?
+        """,
+        (icao,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "icao": row["icao"],
+        "iata": row["iata"],
+        "name": row["name"],
+        "country": row["country"],
+        "region": row["region"],
+        "municipality": row["municipality"],
+        "latitude_deg": row["latitude_deg"],
+        "longitude_deg": row["longitude_deg"],
+        "elevation_ft": row["elevation_ft"],
+        "type": row["type"],
+    }
+
+
+def build_atis_payload(conn: sqlite3.Connection, icao: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT callsign, airport, atis_code, frequency, text, last_updated
+        FROM vatsim_atis_latest
+        WHERE airport = ?
+        ORDER BY last_updated DESC
+        LIMIT 1
+        """,
+        (icao,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "callsign": row["callsign"],
+        "airport": row["airport"],
+        "atis_code": row["atis_code"],
+        "frequency": row["frequency"],
+        "text": row["text"],
+        "last_updated": row["last_updated"],
+    }
+
+
+def build_airport_status_payload(conn: sqlite3.Connection, icao: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT airport, controller_count, has_atc, has_atis, atis_callsign, atis_frequency,
+               overall_score, challenge_level, flight_category, wx_summary, raw_metar, raw_taf
+        FROM airport_live_status_latest
+        WHERE airport = ?
+        """,
+        (icao,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    controller_rows = conn.execute(
+        """
+        SELECT callsign, name, facility, frequency, rating, server, logon_time, last_updated
+        FROM vatsim_controllers_latest
+        WHERE facility IS NOT NULL AND facility > 0 AND callsign LIKE ?
+        ORDER BY facility ASC, callsign ASC
+        """,
+        (f"{icao}_%",),
+    ).fetchall()
+    controllers = [
+        {
+            "callsign": controller["callsign"],
+            "name": controller["name"],
+            "facility": controller["facility"],
+            "frequency": controller["frequency"],
+            "rating": controller["rating"],
+            "server": controller["server"],
+            "logon_time": controller["logon_time"],
+            "last_updated": controller["last_updated"],
+        }
+        for controller in controller_rows
+    ]
+
+    return {
+        "airport": row["airport"],
+        "controller_count": row["controller_count"],
+        "has_atc": bool(row["has_atc"]),
+        "has_atis": bool(row["has_atis"]),
+        "atis_callsign": row["atis_callsign"],
+        "atis_frequency": row["atis_frequency"],
+        "overall_score": row["overall_score"],
+        "challenge_level": row["challenge_level"],
+        "flight_category": row["flight_category"],
+        "wx_summary": row["wx_summary"],
+        "raw_metar": row["raw_metar"],
+        "raw_taf": row["raw_taf"],
+        "controllers": controllers,
+    }
+
+
+def build_vatsim_airport_payload(conn: sqlite3.Connection, icao: str) -> dict[str, Any]:
+    """
+    VATSIM online controllers and ATIS for an airport prefix (e.g. EGCC_TWR).
+    Does not require airport_live_status_latest; reads vatsim_*_latest tables only.
+    """
+    prefix = f"{icao}_%"
+    controller_rows = conn.execute(
+        """
+        SELECT callsign, name, facility, frequency, rating, server, logon_time, last_updated
+        FROM vatsim_controllers_latest
+        WHERE facility IS NOT NULL AND facility > 0 AND callsign LIKE ?
+        ORDER BY facility ASC, callsign ASC
+        """,
+        (prefix,),
+    ).fetchall()
+    controllers: list[dict[str, Any]] = []
+    for row in controller_rows:
+        fac = row["facility"]
+        controllers.append(
+            {
+                "callsign": row["callsign"],
+                "name": row["name"],
+                "facility": fac,
+                "facility_label": _facility_label(fac),
+                "frequency": row["frequency"],
+                "rating": row["rating"],
+                "server": row["server"],
+                "logon_time": row["logon_time"],
+                "last_updated": row["last_updated"],
+            }
+        )
+
+    atis_rows = conn.execute(
+        """
+        SELECT callsign, airport, atis_code, frequency, text, last_updated
+        FROM vatsim_atis_latest
+        WHERE UPPER(TRIM(airport)) = ?
+        ORDER BY last_updated DESC
+        """,
+        (icao,),
+    ).fetchall()
+    atis_list = [
+        {
+            "callsign": row["callsign"],
+            "atis_code": row["atis_code"],
+            "frequency": row["frequency"],
+            "text": row["text"],
+            "last_updated": row["last_updated"],
+        }
+        for row in atis_rows
+    ]
+
+    return {
+        "icao": icao,
+        "source": "vatsim",
+        "controller_count": len(controllers),
+        "controllers": controllers,
+        "atis": atis_list,
+        "has_atis": len(atis_list) > 0,
+        "fetched_at": utc_now_iso(),
     }
 
 
@@ -570,6 +827,24 @@ class WidgetHandler(BaseHTTPRequestHandler):
             if parsed.path == WEATHER_CURRENT_PATH:
                 self._handle_weather_current(parsed.query)
                 return
+            if parsed.path == METAR_PATH:
+                self._handle_metar(parsed.query)
+                return
+            if parsed.path == TAF_PATH:
+                self._handle_taf(parsed.query)
+                return
+            if parsed.path == STATION_PATH:
+                self._handle_station(parsed.query)
+                return
+            if parsed.path == ATIS_PATH:
+                self._handle_atis(parsed.query)
+                return
+            if parsed.path == AIRPORT_STATUS_PATH:
+                self._handle_airport_status(parsed.query)
+                return
+            if parsed.path == VATSIM_AIRPORT_PATH:
+                self._handle_vatsim_airport(parsed.query)
+                return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except Exception as exc:  # noqa: BLE001
             LOGGER.exception("request failed: %s", exc)
@@ -587,13 +862,9 @@ class WidgetHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, response)
 
     def _handle_weather_current(self, query: str) -> None:
-        params = parse_qs(query)
-        icao = (params.get("icao", [""])[0] or "").strip().upper()
-        if not icao:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "icao_required"})
-            return
-        if len(icao) != 4 or not icao.isalnum():
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_icao"})
+        icao, error = _parse_icao_from_query(query)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
             return
 
         with _open_readonly_connection(self.db_path) as conn:
@@ -602,6 +873,75 @@ class WidgetHandler(BaseHTTPRequestHandler):
         if payload is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "metar_not_found", "icao": icao})
             return
+        self._send_json(HTTPStatus.OK, payload)
+
+    def _handle_metar(self, query: str) -> None:
+        icao, error = _parse_icao_from_query(query)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        with _open_readonly_connection(self.db_path) as conn:
+            payload = build_metar_payload(conn, icao)
+        if payload is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "metar_not_found", "icao": icao})
+            return
+        self._send_json(HTTPStatus.OK, payload)
+
+    def _handle_taf(self, query: str) -> None:
+        icao, error = _parse_icao_from_query(query)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        with _open_readonly_connection(self.db_path) as conn:
+            payload = build_taf_payload(conn, icao)
+        if payload is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "taf_not_found", "icao": icao})
+            return
+        self._send_json(HTTPStatus.OK, payload)
+
+    def _handle_station(self, query: str) -> None:
+        icao, error = _parse_icao_from_query(query)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        with _open_readonly_connection(self.db_path) as conn:
+            payload = build_station_payload(conn, icao)
+        if payload is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "station_not_found", "icao": icao})
+            return
+        self._send_json(HTTPStatus.OK, payload)
+
+    def _handle_atis(self, query: str) -> None:
+        icao, error = _parse_icao_from_query(query)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        with _open_readonly_connection(self.db_path) as conn:
+            payload = build_atis_payload(conn, icao)
+        if payload is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "atis_not_found", "icao": icao})
+            return
+        self._send_json(HTTPStatus.OK, payload)
+
+    def _handle_airport_status(self, query: str) -> None:
+        icao, error = _parse_icao_from_query(query)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        with _open_readonly_connection(self.db_path) as conn:
+            payload = build_airport_status_payload(conn, icao)
+        if payload is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "airport_not_found", "icao": icao})
+            return
+        self._send_json(HTTPStatus.OK, payload)
+
+    def _handle_vatsim_airport(self, query: str) -> None:
+        icao, error = _parse_vatsim_airport_icao_query(query)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        with _open_readonly_connection(self.db_path) as conn:
+            payload = build_vatsim_airport_payload(conn, icao)
         self._send_json(HTTPStatus.OK, payload)
 
     def log_message(self, fmt: str, *args: object) -> None:
