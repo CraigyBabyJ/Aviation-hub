@@ -36,6 +36,8 @@ VATSIM_BOOKINGS_PATH = "/api/vatsim/bookings"
 VATSIM_INBOUNDS_PATH = "/api/vatsim/inbounds"
 VATSIM_LOOKUP_PATH = "/api/vatsim/lookup"
 AIRPORT_BRIEF_PATH = "/api/airport/brief"
+SIGMETS_PATH = "/api/sigmets"
+AIRPORT_RUNWAYS_PATH = "/api/airport/runways"
 HTTP_ROUTES = {
     "current_spicy_airports": WIDGET_PATH,
     "weather_current": WEATHER_CURRENT_PATH,
@@ -54,6 +56,8 @@ HTTP_ROUTES = {
     "vatsim_inbounds": VATSIM_INBOUNDS_PATH,
     "vatsim_lookup": VATSIM_LOOKUP_PATH,
     "airport_brief": AIRPORT_BRIEF_PATH,
+    "sigmets": SIGMETS_PATH,
+    "airport_runways": AIRPORT_RUNWAYS_PATH,
 }
 
 # VATSIM controller facility codes (see VATSIM API / network documentation).
@@ -1746,6 +1750,102 @@ def build_airports_ranked_payload(
     }
 
 
+def build_sigmets_payload(
+    conn: sqlite3.Connection,
+    *,
+    hazard: str | None = None,
+    fir: str | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Active SIGMETs (valid_to >= now), optionally filtered by hazard type and/or FIR prefix."""
+    now = utc_now_iso()
+    sql = """
+        SELECT id, fir, fir_name, hazard, qualifier, base, top,
+               movement_dir, movement_speed, valid_from, valid_to, raw_text
+        FROM sigmets
+        WHERE valid_to >= ?
+    """
+    params: list[Any] = [now]
+    if hazard:
+        sql += " AND UPPER(hazard) = ?"
+        params.append(hazard.upper())
+    if fir:
+        sql += " AND UPPER(fir) LIKE ?"
+        params.append(f"{fir.upper()}%")
+    sql += " ORDER BY valid_from DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    sigmets = [
+        {
+            "id": row["id"],
+            "fir": row["fir"],
+            "fir_name": row["fir_name"],
+            "hazard": row["hazard"],
+            "qualifier": row["qualifier"],
+            "base_ft": row["base"],
+            "top_ft": row["top"],
+            "movement_dir": row["movement_dir"],
+            "movement_speed": row["movement_speed"],
+            "valid_from": row["valid_from"],
+            "valid_to": row["valid_to"],
+            "raw_text": row["raw_text"],
+        }
+        for row in rows
+    ]
+    return {
+        "generated_at": now,
+        "hazard_filter": hazard,
+        "fir_filter": fir,
+        "count": len(sigmets),
+        "sigmets": sigmets,
+    }
+
+
+def build_airport_runways_payload(
+    conn: sqlite3.Connection,
+    icao: str,
+) -> dict[str, Any] | None:
+    """All runway pairs for an airport, ordered longest first."""
+    ref = conn.execute(
+        "SELECT icao, name FROM airport_reference_latest WHERE icao = ?",
+        (icao,),
+    ).fetchone()
+    rows = conn.execute(
+        """
+        SELECT length_ft, width_ft, surface, surface_class, lighted, closed,
+               le_ident, he_ident, le_heading_degT, he_heading_degT
+        FROM airport_runways_latest
+        WHERE airport_icao = ?
+        ORDER BY length_ft DESC
+        """,
+        (icao,),
+    ).fetchall()
+    if not rows and ref is None:
+        return None
+    runways = [
+        {
+            "le_ident": row["le_ident"],
+            "he_ident": row["he_ident"],
+            "length_ft": row["length_ft"],
+            "width_ft": row["width_ft"],
+            "surface": row["surface"],
+            "surface_class": row["surface_class"],
+            "lighted": bool(row["lighted"]),
+            "closed": bool(row["closed"]),
+            "le_heading_degT": row["le_heading_degT"],
+            "he_heading_degT": row["he_heading_degT"],
+        }
+        for row in rows
+    ]
+    return {
+        "icao": icao,
+        "name": ref["name"] if ref else None,
+        "generated_at": utc_now_iso(),
+        "runway_count": len(runways),
+        "runways": runways,
+    }
+
+
 class WidgetHandler(BaseHTTPRequestHandler):
     db_path: Path = DB_PATH
 
@@ -1802,6 +1902,12 @@ class WidgetHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == AIRPORT_BRIEF_PATH:
                 self._handle_airport_brief(parsed.query)
+                return
+            if parsed.path == SIGMETS_PATH:
+                self._handle_sigmets(parsed.query)
+                return
+            if parsed.path == AIRPORT_RUNWAYS_PATH:
+                self._handle_airport_runways(parsed.query)
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except Exception as exc:  # noqa: BLE001
@@ -2037,6 +2143,27 @@ class WidgetHandler(BaseHTTPRequestHandler):
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"error": "brief_unavailable", "detail": str(exc)},
             )
+
+    def _handle_sigmets(self, query: str) -> None:
+        params = parse_qs(query)
+        hazard = (params.get("hazard", [""])[0] or "").strip().upper() or None
+        fir = (params.get("fir", [""])[0] or "").strip().upper() or None
+        limit = _parse_limit_from_query(query, default=20, max_limit=50)
+        with _open_readonly_connection(self.db_path) as conn:
+            payload = build_sigmets_payload(conn, hazard=hazard, fir=fir, limit=limit)
+        self._send_json(HTTPStatus.OK, payload)
+
+    def _handle_airport_runways(self, query: str) -> None:
+        icao, error = _parse_icao_from_query(query)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        with _open_readonly_connection(self.db_path) as conn:
+            payload = build_airport_runways_payload(conn, icao)
+        if payload is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "airport_not_found", "icao": icao})
+            return
+        self._send_json(HTTPStatus.OK, payload)
 
     def log_message(self, fmt: str, *args: object) -> None:
         LOGGER.info("widget_http %s", fmt % args)

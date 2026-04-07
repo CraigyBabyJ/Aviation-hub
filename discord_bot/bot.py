@@ -436,11 +436,15 @@ async def cmd_bookings(
     lines = []
     for b in rows:
         cs = b.get("callsign")
-        t0 = b.get("starts_at_utc")
-        t1 = b.get("ends_at_utc")
+        t0_unix = _iso_to_unix(b.get("starts_at_utc"))
+        t1_unix = _iso_to_unix(b.get("ends_at_utc"))
         pos = b.get("position_type") or ""
-        lines.append(f"`{t0}`–`{t1}` **{cs}** ({pos})".strip())
-    desc = "\n".join(lines)
+        start_str = f"<t:{t0_unix}:f>" if t0_unix else (b.get("starts_at_utc") or "?")
+        end_str = f"<t:{t1_unix}:t>" if t1_unix else (b.get("ends_at_utc") or "?")
+        relative = f"  (<t:{t0_unix}:R>)" if t0_unix else ""
+        pos_label = f" · {pos}" if pos else ""
+        lines.append(f"**`{cs}`**{pos_label}\n{start_str} → {end_str}{relative}")
+    desc = "\n\n".join(lines)
     embed = discord.Embed(
         title=f"ATC bookings{f' @ {icao}' if icao else ''}",
         description=_truncate(desc, 3900),
@@ -1008,19 +1012,91 @@ async def cmd_weather(interaction: discord.Interaction, icao: str) -> None:
     wx = data.get("wx_summary") or ""
     cat = data.get("flight_category") or ""
     wind = data.get("wind") or {}
-    wind_s = ""
-    if isinstance(wind, dict):
-        wind_s = f"{wind.get('dir_degrees', '')}° @ {wind.get('speed_kt', '')} kt"
-        if wind.get("gust_kt"):
-            wind_s += f" G{wind['gust_kt']}"
-    embed = discord.Embed(title=f"Weather — {code}", color=discord.Color.teal())
+    temp_c = data.get("temp_c")
+    pressure = data.get("pressure") or {}
+    visibility = data.get("visibility") or {}
+    cloud_layers = data.get("cloud_layers") or []
+    precip = data.get("precip")
+    observed_at = data.get("observed_at")
+
+    # Flight category colour accent
+    _cat_colors = {
+        "VFR": discord.Color.green(),
+        "MVFR": discord.Color.blue(),
+        "IFR": discord.Color.red(),
+        "LIFR": discord.Color.from_rgb(180, 0, 180),
+    }
+    color = _cat_colors.get(str(cat).upper(), discord.Color.teal())
+
+    embed = discord.Embed(title=f"Weather — {code}", color=color)
+
+    # METAR raw text
     embed.add_field(name="METAR", value=_truncate(metar, 1000) or "—", inline=False)
-    if wx:
-        embed.add_field(name="Summary", value=_truncate(wx, 500), inline=False)
+
+    # Key conditions row
     if cat:
         embed.add_field(name="Flight category", value=str(cat), inline=True)
+
+    wind_s = ""
+    if isinstance(wind, dict) and (wind.get("speed_kt") is not None):
+        dir_deg = wind.get("dir_degrees")
+        spd = wind.get("speed_kt")
+        gust = wind.get("gust_kt")
+        wind_s = (f"{dir_deg}°" if dir_deg is not None else "VRB") + f" @ {spd} kt"
+        if gust:
+            wind_s += f" G{gust} kt"
     if wind_s:
         embed.add_field(name="Wind", value=wind_s, inline=True)
+
+    if temp_c is not None:
+        temp_f = round(temp_c * 9 / 5 + 32, 1)
+        embed.add_field(name="Temp", value=f"{temp_c}°C / {temp_f}°F", inline=True)
+
+    if isinstance(visibility, dict):
+        vis_m = visibility.get("meters")
+        vis_mi = visibility.get("statute_mi")
+        if vis_m is not None or vis_mi is not None:
+            vis_parts = []
+            if vis_m is not None:
+                vis_parts.append(f"{vis_m:,} m")
+            if vis_mi is not None:
+                vis_parts.append(f"{vis_mi} SM")
+            embed.add_field(name="Visibility", value=" / ".join(vis_parts), inline=True)
+
+    if isinstance(pressure, dict):
+        hpa = pressure.get("hpa")
+        inhg = pressure.get("in_hg")
+        if hpa or inhg:
+            p_parts = []
+            if hpa:
+                p_parts.append(f"{hpa} hPa")
+            if inhg:
+                p_parts.append(f"{inhg} inHg")
+            embed.add_field(name="Pressure", value=" / ".join(str(x) for x in p_parts), inline=True)
+
+    if cloud_layers:
+        _cov_labels = {"FEW": "Few", "SCT": "Scattered", "BKN": "Broken", "OVC": "Overcast", "VV": "Vert. vis."}
+        layer_strs = []
+        for layer in cloud_layers:
+            cov = layer.get("coverage") or "?"
+            base = layer.get("base_ft_agl")
+            ctype = layer.get("cloud_type") or ""
+            label = _cov_labels.get(cov, cov)
+            base_str = f"{base:,} ft" if base is not None else "—"
+            type_str = f" ({ctype})" if ctype else ""
+            layer_strs.append(f"{label} {base_str}{type_str}")
+        embed.add_field(name="Clouds", value="\n".join(layer_strs), inline=True)
+
+    if precip:
+        embed.add_field(name="Precipitation", value=precip.replace("-", " ").title(), inline=True)
+
+    if wx:
+        embed.add_field(name="Summary", value=_truncate(wx, 500), inline=False)
+
+    if observed_at:
+        ts = _iso_to_unix(observed_at)
+        embed.set_footer(text=f"Observed: {f'<t:{ts}:f>' if ts else observed_at}")
+
     await interaction.followup.send(embed=embed)
 
 
@@ -1093,9 +1169,11 @@ async def cmd_vatsim(interaction: discord.Interaction, query: str) -> None:
     if kind == "controller":
         c = data.get("controller") or {}
         fac = c.get("facility_label") or c.get("facility")
+        online_since = _format_online_since(c.get("logon_time"))
         lines = [
             f"**{c.get('name') or '—'}** · CID {c.get('cid', '—')}",
             f"**{fac}** · {c.get('frequency') or '—'} · rating {c.get('rating', '—')}",
+            f"**Online since:** {online_since}",
             f"**Server:** {c.get('server') or '—'}",
         ]
         embed = discord.Embed(
@@ -1132,6 +1210,316 @@ async def cmd_vatsim(interaction: discord.Interaction, query: str) -> None:
     await interaction.followup.send(f"Unexpected response kind: `{kind}`", ephemeral=True)
 
 
+@bot.tree.command(name="taf", description="Terminal Aerodrome Forecast for an airport (Aviation Hub DB)")
+@app_commands.describe(icao="4-letter ICAO")
+async def cmd_taf(interaction: discord.Interaction, icao: str) -> None:
+    session = bot.http_session
+    assert session is not None
+    code = icao.strip().upper()
+    if len(code) != 4 or not code.isalnum():
+        await interaction.response.send_message("ICAO must be 4 alphanumeric characters.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)
+    status, data = await _hub_get(session, "/api/taf", icao=code)
+    if status == 404:
+        await interaction.followup.send(f"No TAF in database for **`{code}`** (not all airports have TAF coverage).")
+        return
+    if status != 200:
+        await interaction.followup.send(f"Hub returned **{status}** for `{code}`.", ephemeral=True)
+        return
+
+    raw = data.get("raw_text") or ""
+    issue = data.get("issue_time")
+    valid_from = data.get("valid_from_time")
+    valid_to = data.get("valid_to_time")
+
+    # Build a readable header showing the validity window
+    header_parts: list[str] = []
+    if issue:
+        ts = _iso_to_unix(issue)
+        header_parts.append(f"**Issued:** {f'<t:{ts}:f>' if ts else issue}")
+    if valid_from and valid_to:
+        ts_f = _iso_to_unix(valid_from)
+        ts_t = _iso_to_unix(valid_to)
+        f_str = f"<t:{ts_f}:f>" if ts_f else valid_from
+        t_str = f"<t:{ts_t}:t>" if ts_t else valid_to
+        r_str = f" (<t:{ts_t}:R>)" if ts_t else ""
+        header_parts.append(f"**Valid:** {f_str} → {t_str}{r_str}")
+
+    embed = discord.Embed(
+        title=f"TAF — {code}",
+        description="\n".join(header_parts) if header_parts else None,
+        color=discord.Color.blue(),
+    )
+    embed.add_field(
+        name="Forecast",
+        value=f"```{_truncate(raw, 990)}```" if raw else "—",
+        inline=False,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="atis", description="Live VATSIM ATIS for an airport (Aviation Hub snapshot)")
+@app_commands.describe(icao="4-letter ICAO")
+async def cmd_atis(interaction: discord.Interaction, icao: str) -> None:
+    session = bot.http_session
+    assert session is not None
+    code = icao.strip().upper()
+    if len(code) != 4 or not code.isalnum():
+        await interaction.response.send_message("ICAO must be 4 alphanumeric characters.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)
+    status, data = await _hub_get(session, "/api/atis", icao=code)
+    if status == 404:
+        await interaction.followup.send(
+            f"No ATIS online for **`{code}`** right now — an ATIS controller must be active on VATSIM."
+        )
+        return
+    if status != 200:
+        await interaction.followup.send(f"Hub returned **{status}** for `{code}`.", ephemeral=True)
+        return
+
+    callsign = data.get("callsign") or f"{code}_ATIS"
+    atis_code = data.get("atis_code") or "?"
+    freq = data.get("frequency") or "—"
+    text = data.get("text") or ""
+    updated = data.get("last_updated")
+
+    # ATIS information letter in readable form
+    letter_map = {c: f"Information **{c}**" for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"}
+    info_label = letter_map.get(str(atis_code).upper(), f"Code **{atis_code}**")
+
+    embed = discord.Embed(
+        title=f"ATIS — {code}  ·  {info_label}",
+        color=discord.Color.dark_teal(),
+    )
+    embed.add_field(name="Station", value=f"`{callsign}`", inline=True)
+    embed.add_field(name="Frequency", value=str(freq), inline=True)
+    if text:
+        embed.add_field(
+            name="Text",
+            value=f"```{_truncate(text, 990)}```",
+            inline=False,
+        )
+    if updated:
+        ts = _iso_to_unix(updated)
+        embed.set_footer(text=f"Last updated: {f'<t:{ts}:R>' if ts else updated}")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="sigmet", description="Active international SIGMETs (Aviation Hub DB)")
+@app_commands.describe(
+    hazard="Filter by hazard type (leave blank for all)",
+    fir="Filter by FIR prefix, e.g. EG, LS, K (leave blank for global)",
+)
+@app_commands.choices(
+    hazard=[
+        app_commands.Choice(name="All", value="all"),
+        app_commands.Choice(name="Turbulence (TURB)", value="TURB"),
+        app_commands.Choice(name="Icing (ICE)", value="ICE"),
+        app_commands.Choice(name="Thunderstorm (TS)", value="TS"),
+        app_commands.Choice(name="Volcanic Ash (VA)", value="VA"),
+        app_commands.Choice(name="Tropical Cyclone (TC)", value="TC"),
+        app_commands.Choice(name="Mountain Wave (MTW)", value="MTW"),
+    ]
+)
+async def cmd_sigmet(
+    interaction: discord.Interaction,
+    hazard: app_commands.Choice[str] | None = None,
+    fir: str | None = None,
+) -> None:
+    session = bot.http_session
+    assert session is not None
+    await interaction.response.defer(thinking=True)
+
+    hazard_val = None if (hazard is None or hazard.value == "all") else hazard.value
+    fir_val = fir.strip().upper() if fir else None
+
+    status, data = await _hub_get(
+        session,
+        "/api/sigmets",
+        hazard=hazard_val,
+        fir=fir_val,
+        limit=15,
+    )
+    if status != 200:
+        await interaction.followup.send(f"Hub returned **{status}**: `{data.get('error', data)}`", ephemeral=True)
+        return
+
+    sigmets = data.get("sigmets") or []
+    count = data.get("count", len(sigmets))
+
+    # Hazard emoji map
+    _hazard_icon: dict[str, str] = {
+        "TURB": "〰️",
+        "ICE": "🧊",
+        "TS": "⛈️",
+        "VA": "🌋",
+        "TC": "🌀",
+        "MTW": "🏔️",
+    }
+
+    if not sigmets:
+        filt = ""
+        if hazard_val:
+            filt += f" hazard={hazard_val}"
+        if fir_val:
+            filt += f" FIR={fir_val}"
+        await interaction.followup.send(f"No active SIGMETs in database{filt}.")
+        return
+
+    lines: list[str] = []
+    for s in sigmets:
+        haz = (s.get("hazard") or "?").upper()
+        icon = _hazard_icon.get(haz, "⚠️")
+        qual = s.get("qualifier") or ""
+        fir_id = s.get("fir") or "?"
+        fir_name = s.get("fir_name") or ""
+        base_ft = s.get("base_ft")
+        top_ft = s.get("top_ft")
+        valid_from = s.get("valid_from")
+        valid_to = s.get("valid_to")
+        raw = s.get("raw_text") or ""
+
+        # Altitude band
+        if base_ft is not None and top_ft is not None:
+            alt_str = f"FL{base_ft // 100:03d}–FL{top_ft // 100:03d}"
+        elif top_ft is not None:
+            alt_str = f"up to FL{top_ft // 100:03d}"
+        else:
+            alt_str = ""
+
+        # Validity window with Discord timestamps
+        ts_f = _iso_to_unix(valid_from)
+        ts_t = _iso_to_unix(valid_to)
+        when = ""
+        if ts_f and ts_t:
+            when = f"<t:{ts_f}:t> → <t:{ts_t}:t>  (<t:{ts_t}:R>)"
+        elif ts_f:
+            when = f"<t:{ts_f}:f>"
+
+        # Concise label line
+        hazard_label = f"{icon} **{haz}**" + (f" ({qual})" if qual else "")
+        fir_label = f"`{fir_id}`" + (f" {fir_name}" if fir_name else "")
+        detail_parts = [x for x in [alt_str, when] if x]
+        detail = "  ·  ".join(detail_parts)
+
+        lines.append(f"{hazard_label}  ·  {fir_label}")
+        if detail:
+            lines.append(f"  {detail}")
+        if raw:
+            lines.append(f"  `{_truncate(raw, 160)}`")
+        lines.append("")  # blank separator between SIGMETs
+
+    title = "Active SIGMETs"
+    if hazard_val:
+        title += f" — {hazard_val}"
+    if fir_val:
+        title += f" · FIR {fir_val}"
+
+    embed = discord.Embed(
+        title=title,
+        description=_truncate("\n".join(lines).rstrip(), 3900),
+        color=discord.Color.orange(),
+    )
+    embed.set_footer(text=f"{count} active SIGMET(s) · sourced from AviationWeather.gov · advisory only")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="runway", description="Runway details for an airport (length, surface, headings)")
+@app_commands.describe(icao="4-letter ICAO")
+async def cmd_runway(interaction: discord.Interaction, icao: str) -> None:
+    session = bot.http_session
+    assert session is not None
+    code = icao.strip().upper()
+    if len(code) != 4 or not code.isalnum():
+        await interaction.response.send_message("ICAO must be 4 alphanumeric characters.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)
+    status, data = await _hub_get(session, "/api/airport/runways", icao=code)
+    if status == 404:
+        await interaction.followup.send(
+            f"No runway data in database for **`{code}`** — airport may not be in OurAirports reference."
+        )
+        return
+    if status != 200:
+        await interaction.followup.send(f"Hub returned **{status}** for `{code}`.", ephemeral=True)
+        return
+
+    runways = data.get("runways") or []
+    name = data.get("name") or code
+
+    if not runways:
+        await interaction.followup.send(f"**{code}** is in the reference database but has no runway records.")
+        return
+
+    # Surface class display labels
+    _surface_labels: dict[str, str] = {
+        "hard": "Hard",
+        "soft": "Soft",
+        "water": "Water",
+        "unknown": "?",
+    }
+
+    lines: list[str] = []
+    for rwy in runways:
+        le = rwy.get("le_ident") or "??"
+        he = rwy.get("he_ident") or "??"
+        length = rwy.get("length_ft")
+        width = rwy.get("width_ft")
+        surface = rwy.get("surface") or ""
+        surface_class = rwy.get("surface_class") or ""
+        lighted = rwy.get("lighted", False)
+        closed = rwy.get("closed", False)
+        le_hdg = rwy.get("le_heading_degT")
+        he_hdg = rwy.get("he_heading_degT")
+
+        # Runway designator pair
+        rwy_id = f"**{le}/{he}**"
+        if closed:
+            rwy_id += "  🚫 CLOSED"
+
+        # Heading string
+        if le_hdg is not None and he_hdg is not None:
+            hdg_str = f"{le_hdg:.0f}°/{he_hdg:.0f}°T"
+        elif le_hdg is not None:
+            hdg_str = f"{le_hdg:.0f}°T"
+        else:
+            hdg_str = ""
+
+        # Dimensions
+        dim_parts: list[str] = []
+        if length:
+            dim_parts.append(f"{length:,} ft")
+        if width:
+            dim_parts.append(f"{width} ft wide")
+        dim_str = " · ".join(dim_parts)
+
+        # Surface
+        surf_display = _surface_labels.get(surface_class.lower(), surface_class) if surface_class else ""
+        if surface and surface.upper() != surface_class.upper():
+            surf_display = surface if not surf_display else f"{surf_display} ({surface})"
+
+        # Icons
+        icons: list[str] = []
+        if lighted:
+            icons.append("💡 Lighted")
+        icon_str = "  ·  ".join(icons)
+
+        # Assemble the line
+        detail_parts = [x for x in [hdg_str, dim_str, surf_display, icon_str] if x]
+        lines.append(f"{rwy_id}")
+        lines.append("  " + "  ·  ".join(detail_parts) if detail_parts else "  —")
+
+    embed = discord.Embed(
+        title=f"Runways — {code}",
+        description=f"**{name}** · {len(runways)} runway pair(s)\n\n" + "\n".join(lines),
+        color=discord.Color.dark_gray(),
+    )
+    embed.set_footer(text="Source: OurAirports reference data")
+    await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(
     name="help",
     description="Show every slash command and its description",
@@ -1140,17 +1528,19 @@ async def cmd_help(interaction: discord.Interaction) -> None:
     cmds = list(bot.tree.get_commands())
     by_name = {c.name: c for c in cmds}
 
-    weather_airport_names = ("airport", "metar", "spicy", "summary", "weather")
+    weather_names = ("atis", "metar", "sigmet", "taf", "weather")
+    airport_names = ("airport", "runway", "spicy", "summary")
     vatsim_names = ("bookings", "events", "inbounds", "ranked", "upcoming", "vatsim")
     meta_names = ("help", "info", "ping")
 
     def pick(names: tuple[str, ...]) -> list[app_commands.AppCommand]:
         return [by_name[n] for n in names if n in by_name]
 
-    weather_cmds = pick(weather_airport_names)
+    weather_cmds = pick(weather_names)
+    airport_cmds = pick(airport_names)
     vatsim_cmds = pick(vatsim_names)
     meta_cmds = pick(meta_names)
-    known = set(weather_airport_names) | set(vatsim_names) | set(meta_names)
+    known = set(weather_names) | set(airport_names) | set(vatsim_names) | set(meta_names)
     other_cmds = [c for c in cmds if c.name not in known]
 
     embed = discord.Embed(
@@ -1160,8 +1550,13 @@ async def cmd_help(interaction: discord.Interaction) -> None:
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(
-        name="Weather & airports",
+        name="Weather & conditions",
         value=_truncate(_help_embed_field_lines(weather_cmds), 1024) or "—",
+        inline=False,
+    )
+    embed.add_field(
+        name="Airport & reference",
+        value=_truncate(_help_embed_field_lines(airport_cmds), 1024) or "—",
         inline=False,
     )
     embed.add_field(
