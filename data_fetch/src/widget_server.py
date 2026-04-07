@@ -4,9 +4,11 @@ import argparse
 import json
 import logging
 import math
+import os
 import re
 import sqlite3
 import time
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,6 +40,7 @@ VATSIM_LOOKUP_PATH = "/api/vatsim/lookup"
 AIRPORT_BRIEF_PATH = "/api/airport/brief"
 SIGMETS_PATH = "/api/sigmets"
 AIRPORT_RUNWAYS_PATH = "/api/airport/runways"
+SATELLITE_IMAGE_PATH = "/api/satellite"
 HTTP_ROUTES = {
     "current_spicy_airports": WIDGET_PATH,
     "weather_current": WEATHER_CURRENT_PATH,
@@ -58,6 +61,7 @@ HTTP_ROUTES = {
     "airport_brief": AIRPORT_BRIEF_PATH,
     "sigmets": SIGMETS_PATH,
     "airport_runways": AIRPORT_RUNWAYS_PATH,
+    "satellite": SATELLITE_IMAGE_PATH,
 }
 
 # VATSIM controller facility codes (see VATSIM API / network documentation).
@@ -1846,6 +1850,72 @@ def build_airport_runways_payload(
     }
 
 
+_SAT_CACHE_DIR = Path(os.environ.get("SAT_CACHE_DIR", "")).expanduser() if os.environ.get("SAT_CACHE_DIR") else (
+    Path(__file__).parent.parent.parent / "data" / "sat_cache"
+)
+
+
+def _sat_cache_path(icao: str) -> Path:
+    return _SAT_CACHE_DIR / f"{icao.upper()}.png"
+
+
+def fetch_satellite_image(conn: sqlite3.Connection, icao: str) -> bytes | None:
+    """
+    Return PNG bytes for an aerial satellite image of the given airport.
+    Checks the local cache first; if absent, fetches from Bing Maps Aerial API
+    and saves to cache so subsequent calls are free.
+    Returns None if the airport has no coordinates or Bing key is not configured.
+    """
+    icao = icao.upper().strip()
+    cache_path = _sat_cache_path(icao)
+
+    if cache_path.is_file():
+        LOGGER.debug("sat cache hit: %s", icao)
+        return cache_path.read_bytes()
+
+    # Need coordinates — look up from airport reference
+    row = conn.execute(
+        "SELECT latitude_deg, longitude_deg FROM airport_reference_latest WHERE icao = ?",
+        (icao,),
+    ).fetchone()
+    if row is None or row["latitude_deg"] is None or row["longitude_deg"] is None:
+        LOGGER.warning("sat: no coordinates for %s", icao)
+        return None
+
+    bing_key = os.environ.get("BING_MAPS_KEY", "").strip()
+    if not bing_key:
+        LOGGER.warning("sat: BING_MAPS_KEY not set, cannot fetch image for %s", icao)
+        return None
+
+    lat = row["latitude_deg"]
+    lon = row["longitude_deg"]
+    url = (
+        f"https://dev.virtualearth.net/REST/v1/Imagery/Map/Aerial/{lat},{lon}/14"
+        f"?mapSize=800,500&key={bing_key}"
+    )
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "AviationHub/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if resp.status != 200:
+                LOGGER.warning("sat: Bing returned %s for %s", resp.status, icao)
+                return None
+            image_bytes = resp.read()
+    except Exception as exc:
+        LOGGER.warning("sat: Bing fetch failed for %s: %s", icao, exc)
+        return None
+
+    # Write to cache
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(image_bytes)
+        LOGGER.info("sat: cached %s (%d bytes) → %s", icao, len(image_bytes), cache_path)
+    except OSError as exc:
+        LOGGER.warning("sat: could not write cache for %s: %s", icao, exc)
+
+    return image_bytes
+
+
 class WidgetHandler(BaseHTTPRequestHandler):
     db_path: Path = DB_PATH
 
@@ -1908,6 +1978,9 @@ class WidgetHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == AIRPORT_RUNWAYS_PATH:
                 self._handle_airport_runways(parsed.query)
+                return
+            if parsed.path == SATELLITE_IMAGE_PATH:
+                self._handle_satellite(parsed.query)
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
         except Exception as exc:  # noqa: BLE001
@@ -2143,6 +2216,27 @@ class WidgetHandler(BaseHTTPRequestHandler):
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"error": "brief_unavailable", "detail": str(exc)},
             )
+
+    def _handle_satellite(self, query: str) -> None:
+        icao, error = _parse_icao_from_query(query)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        with _open_readonly_connection(self.db_path) as conn:
+            image_bytes = fetch_satellite_image(conn, icao)
+        if image_bytes is None:
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": "satellite_unavailable", "icao": icao,
+                 "detail": "No coordinates in DB or BING_MAPS_KEY not set"},
+            )
+            return
+        self.send_response(HTTPStatus.OK.value)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(image_bytes)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(image_bytes)
 
     def _handle_sigmets(self, query: str) -> None:
         params = parse_qs(query)

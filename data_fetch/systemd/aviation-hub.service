@@ -8,7 +8,7 @@ Type=simple
 User=craig
 Group=craig
 WorkingDirectory=/home/craig/projects/Aviation-hub/data_fetch
-# Optional: Environment="VATSIM_BOOKINGS_API_KEY=..." or EnvironmentFile=-/etc/aviation-hub.env
+EnvironmentFile=-/home/craig/projects/Aviation-hub/data_fetch/.env
 ExecStart=/home/craig/projects/Aviation-hub/data_fetch/.venv/bin/python /home/craig/projects/Aviation-hub/data_fetch/src/main.py
 Restart=always
 RestartSec=5

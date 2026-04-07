@@ -23,6 +23,7 @@ Discord Developer Portal:
 """
 from __future__ import annotations
 
+import io
 import json
 import logging
 import math
@@ -63,6 +64,7 @@ def _normalize_discord_bot_token(raw: str | None) -> str:
 
 def _hub_base() -> str:
     return os.environ.get("AVIATION_HUB_BASE_URL", "http://127.0.0.1:4010").rstrip("/")
+
 
 
 def _avbot_add_invite_url() -> str | None:
@@ -1520,6 +1522,59 @@ async def cmd_runway(interaction: discord.Interaction, icao: str) -> None:
     await interaction.followup.send(embed=embed)
 
 
+@bot.tree.command(name="sat", description="Satellite aerial image of an airport (Bing Maps, cached locally)")
+@app_commands.describe(icao="4-letter ICAO code")
+async def cmd_sat(interaction: discord.Interaction, icao: str) -> None:
+    session = bot.http_session
+    assert session is not None
+    code = icao.strip().upper()
+    if len(code) != 4 or not code.isalnum():
+        await interaction.response.send_message("ICAO must be 4 alphanumeric characters.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)
+
+    # Fetch airport name for the embed title (best-effort)
+    airport_name = ""
+    st_status, st_data = await _hub_get(session, "/api/station", icao=code)
+    if st_status == 200:
+        airport_name = st_data.get("name") or ""
+
+    # Request the PNG from the hub — it handles cache check and Bing fetch
+    url = _hub_url("/api/satellite", {"icao": code})
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 404:
+                await interaction.followup.send(
+                    f"No satellite image available for **`{code}`** — airport may not be in the reference DB, "
+                    "or `BING_MAPS_KEY` is not set on the hub.",
+                    ephemeral=True,
+                )
+                return
+            if resp.status != 200:
+                await interaction.followup.send(
+                    f"Hub returned **{resp.status}** for satellite image of `{code}`.", ephemeral=True
+                )
+                return
+            image_bytes = await resp.read()
+    except aiohttp.ClientError as exc:
+        LOG.warning("sat fetch failed for %s: %s", code, exc)
+        await interaction.followup.send("Could not reach the Aviation Hub API.", ephemeral=True)
+        return
+
+    title = f"Satellite — {code}"
+    if airport_name:
+        title += f"  ·  {airport_name}"
+
+    embed = discord.Embed(title=title, color=discord.Color.dark_blue())
+    embed.set_image(url="attachment://satellite.png")
+    embed.set_footer(text="Bing Maps Aerial · served from Aviation Hub cache")
+
+    await interaction.followup.send(
+        embed=embed,
+        file=discord.File(io.BytesIO(image_bytes), filename="satellite.png"),
+    )
+
+
 @bot.tree.command(
     name="help",
     description="Show every slash command and its description",
@@ -1529,7 +1584,7 @@ async def cmd_help(interaction: discord.Interaction) -> None:
     by_name = {c.name: c for c in cmds}
 
     weather_names = ("atis", "metar", "sigmet", "taf", "weather")
-    airport_names = ("airport", "runway", "spicy", "summary")
+    airport_names = ("airport", "runway", "sat", "spicy", "summary")
     vatsim_names = ("bookings", "events", "inbounds", "ranked", "upcoming", "vatsim")
     meta_names = ("help", "info", "ping")
 
