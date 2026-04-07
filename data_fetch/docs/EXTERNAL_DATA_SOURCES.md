@@ -12,7 +12,7 @@ This document lists **every outbound HTTP(S) feed** used by the Aviation Hub **d
 |-------------|----------------------|---------------|------|
 | `fetchers/vatsim.py` | — | `https://data.vatsim.net/v3/vatsim-data.json` | Live VATSIM network: controllers, pilots (authoritative for “who is online now”). |
 | `fetchers/atis.py` | — | `https://data.vatsim.net/v3/afv-atis-data.json` | AFV ATIS text per callsign. |
-| `fetchers/ingest_vatsim_events.py` | `VATSIM_EVENTS_URL` | `https://events.vatsim.net/v1/latest` | Published upcoming/current VATSIM **events** (JSON). |
+| `fetchers/ingest_vatsim_events.py` | `VATSIM_EVENTS_URL` | `https://my.vatsim.net/api/v2/events/latest` | Published upcoming/current VATSIM **events** (JSON). |
 | `fetchers/ingest_vatsim_atc_bookings.py` | `VATSIM_BOOKINGS_URL`, optional `VATSIM_BOOKINGS_API_KEY` | `https://atc-bookings.vatsim.net/api/booking` | Scheduled ATC **bookings** (advisory JSON list). |
 | `fetchers/metar.py` | — | `https://aviationweather.gov/data/cache/metars.cache.csv.gz` | AviationWeather **METAR** cache (gzip CSV). |
 | `fetchers/taf.py` | — | `https://aviationweather.gov/data/cache/tafs.cache.xml.gz` | AviationWeather **TAF** cache (gzip XML). |

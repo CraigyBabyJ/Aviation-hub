@@ -119,6 +119,75 @@ def _truncate(text: str | None, max_len: int = 350) -> str:
     return t[: max_len - 1] + "…"
 
 
+def _iso_to_unix(iso_utc: str | None) -> int | None:
+    if not iso_utc:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso_utc).replace("Z", "+00:00"))
+        return int(dt.timestamp())
+    except ValueError:
+        return None
+
+
+def _format_event_time_range(start_utc: str | None, end_utc: str | None) -> str:
+    s = _iso_to_unix(start_utc)
+    e = _iso_to_unix(end_utc)
+    if s and e:
+        return f"<t:{s}:f> → <t:{e}:t>  (<t:{s}:R>)"
+    if s:
+        return f"<t:{s}:f>  (<t:{s}:R>)"
+    if start_utc and end_utc:
+        return f"{start_utc} → {end_utc}"
+    return start_utc or "Unknown time"
+
+
+def _parse_airports_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        raw = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            decoded = json.loads(value)
+            raw = decoded if isinstance(decoded, list) else [value]
+        except json.JSONDecodeError:
+            raw = [value]
+    else:
+        raw = []
+    out: list[str] = []
+    for item in raw:
+        code = str(item).strip().upper()
+        if len(code) == 4 and code.isalnum():
+            out.append(code)
+    return out
+
+
+def _iso_utc_date(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc).date().isoformat()
+    except ValueError:
+        return None
+
+
+_SPICY_REGION_PREFIXES: dict[str, tuple[str, ...]] = {
+    "europe": ("E", "L", "U"),
+    "asia": ("R", "V", "W", "Z", "O", "H"),
+    "us": ("K", "P"),
+    "south_america": ("S",),
+}
+
+
+def _airport_in_region(icao: str, region_key: str | None) -> bool:
+    if not region_key:
+        return True
+    prefixes = _SPICY_REGION_PREFIXES.get(region_key, ())
+    if not prefixes:
+        return True
+    code = (icao or "").strip().upper()
+    return any(code.startswith(p) for p in prefixes)
+
+
 _HELP_DESC_SUFFIXES = (
     " (Aviation Hub)",
     " (Aviation Hub DB)",
@@ -279,20 +348,25 @@ async def cmd_events(
         lines_out: list[str] = []
         for ev in chunk:
             name = ev.get("name") or "?"
-            start = ev.get("start_time_utc") or "?"
-            end = ev.get("end_time_utc") or ""
-            icaos = ev.get("airports_json") or ""
+            start = ev.get("start_time_utc")
+            end = ev.get("end_time_utc")
+            icaos = _parse_airports_list(ev.get("airports_json"))
             link = ev.get("link_url") or ""
-            extra = f" · `{icaos}`" if icaos else ""
-            tail = f" · <{link}>" if link else ""
-            when = f"`{start}` → `{end}`" if end else f"`{start}`"
-            lines_out.append(f"{when} · **{name}**{extra}{tail}")
+            when = _format_event_time_range(start, end)
+            where = ", ".join(f"`{x}`" for x in icaos) if icaos else "—"
+            open_link = f"[Open event]({link})" if link else ""
+            lines_out.append(
+                f"**{name}**\n"
+                f"{when}\n"
+                f"Airports: {where}"
+                + (f" · {open_link}" if open_link else "")
+            )
         return "\n".join(lines_out)
 
     snap = data.get("snapshot_fetched_at")
     w_end = data.get("window_end_utc")
     total = len(events)
-    per_embed = 12
+    per_embed = 6
     chunks = [events[i : i + per_embed] for i in range(0, len(events), per_embed)]
     for idx, chunk in enumerate(chunks):
         title = f"VATSIM events — next {days} days"
@@ -505,19 +579,42 @@ async def cmd_upcoming(
     if not rows:
         await interaction.followup.send(f"No airports with bookings/events in the next **{hours}**h (per DB).")
         return
-    lines = []
-    for r in rows:
-        ap = r.get("airport")
-        lines.append(
-            f"`{ap}` · score **{r.get('busyness_score')}** "
-            f"(b={r.get('bookings')} e={r.get('events')})"
-        )
+    groups = data.get("groups") or {}
+    likely_group = ((groups.get("likely_staffed") or {}).get("airports")) or []
+    event_group = ((groups.get("event_only") or {}).get("airports")) or []
+
+    # Backward compatibility if API groups are absent.
+    if not likely_group and not event_group:
+        for r in rows:
+            if int(r.get("bookings") or 0) > 0:
+                likely_group.append(r)
+            else:
+                event_group.append(r)
+
+    def _fmt_upcoming_row(r: dict) -> str:
+        ap = str(r.get("airport") or "").upper()
+        b = int(r.get("bookings") or 0)
+        e = int(r.get("events") or 0)
+        return f"`{ap}` · score **{r.get('busyness_score')}** (booked ATC positions: {b}, events: {e})"
+
+    likely_staffed = [_fmt_upcoming_row(r) for r in likely_group]
+    event_only = [_fmt_upcoming_row(r) for r in event_group]
+
+    desc_parts = [
+        f"**How to read this**: `booked ATC positions` = scheduled controller slots in next **{hours}h**. `events` = published VATSIM events touching that airport.",
+    ]
+    if likely_staffed:
+        desc_parts.append("**Likely staffed (bookings > 0)**\n" + "\n".join(likely_staffed))
+    if event_only:
+        desc_parts.append("**Event only (no bookings yet)**\n" + "\n".join(event_only))
+    desc_parts.append("Use `/airport ICAO` for a full breakdown at one airport.")
+
     embed = discord.Embed(
         title=f"Busy soon — next {hours}h",
-        description=_truncate("\n".join(lines), 3900),
+        description=_truncate("\n\n".join(desc_parts), 3900),
         color=discord.Color.purple(),
     )
-    embed.set_footer(text=data.get("note", "")[:200])
+    embed.set_footer(text="Score uses bookings + events in window; bookings are advisory (not guaranteed online ATC).")
     await interaction.followup.send(embed=embed)
 
 
@@ -647,13 +744,19 @@ async def cmd_airport(
 
     v = data.get("vatsim") or {}
     ctrls = v.get("controllers") or []
-    v_lines = [f"**{v.get('controller_count', len(ctrls))}** online (VATSIM raw)"]
+    v_lines = []
     for c in ctrls[:12]:
         fac = c.get("facility_label") or c.get("facility")
         v_lines.append(f"• `{c.get('callsign')}` {fac}")
+    if not v_lines:
+        v_lines.append("No ATC positions online right now.")
     if len(ctrls) > 12:
         v_lines.append(f"… +{len(ctrls) - 12} more")
-    embed.add_field(name="VATSIM coverage", value=_truncate("\n".join(v_lines), 1024), inline=False)
+    embed.add_field(
+        name=f"VATSIM coverage (online now: {v.get('controller_count', len(ctrls))})",
+        value=_truncate("\n".join(v_lines), 1024),
+        inline=False,
+    )
 
     ib = data.get("inbounds") or {}
     if ib.get("error"):
@@ -688,23 +791,27 @@ async def cmd_airport(
 
     bk = data.get("bookings") or {}
     items = bk.get("items") or []
-    if items:
+    today_utc = datetime.now(timezone.utc).date().isoformat()
+    todays = [b for b in items if _iso_utc_date(b.get("starts_at_utc")) == today_utc]
+    if todays:
         blines = []
-        for b in items[:bookings_limit]:
+        for b in todays[:bookings_limit]:
             blines.append(
                 f"`{b.get('starts_at_utc')}` **`{b.get('callsign')}`** "
                 f"({b.get('position_type') or '?'})"
             )
+        if len(todays) > bookings_limit:
+            blines.append(f"… +{len(todays) - bookings_limit} more today")
         embed.add_field(
-            name=f"Bookings (advisory, n={len(items)})",
+            name=f"Bookings today (advisory, n={len(todays)})",
             value=_truncate("\n".join(blines), 900),
             inline=False,
         )
     else:
-        msg = "None upcoming in DB."
+        msg = "No bookings today in DB."
         if bk.get("error"):
             msg += f" ({bk['error']})"
-        embed.add_field(name="Bookings (advisory)", value=msg, inline=False)
+        embed.add_field(name="Bookings today (advisory)", value=msg, inline=False)
 
     embed.set_footer(
         text="Inbounds = online pilots only. Bookings advisory. METAR from ingest.",
@@ -742,33 +849,96 @@ async def cmd_metar(interaction: discord.Interaction, icao: str) -> None:
 
 
 @bot.tree.command(name="spicy", description="Current spicy airports widget (Aviation Hub)")
-async def cmd_spicy(interaction: discord.Interaction) -> None:
+@app_commands.describe(region="Optional region filter")
+@app_commands.choices(
+    region=[
+        app_commands.Choice(name="Global", value="global"),
+        app_commands.Choice(name="Europe", value="europe"),
+        app_commands.Choice(name="Asia", value="asia"),
+        app_commands.Choice(name="US", value="us"),
+        app_commands.Choice(name="South America", value="south_america"),
+    ]
+)
+async def cmd_spicy(
+    interaction: discord.Interaction,
+    region: app_commands.Choice[str] | None = None,
+) -> None:
     session = bot.http_session
     assert session is not None
     await interaction.response.defer(thinking=True)
-    status, data = await _hub_get(session, "/widgets/current-spicy-airports")
+
+    region_key = (region.value if region and region.value != "global" else None)
+    if region_key is None:
+        status, data = await _hub_get(session, "/widgets/current-spicy-airports")
+        if status != 200:
+            await interaction.followup.send(f"Hub returned **{status}**.", ephemeral=True)
+            return
+        lines: list[str] = []
+        for label, key in (("Airliner", "airliner"), ("GA", "ga")):
+            row = data.get(key)
+            if not isinstance(row, dict):
+                lines.append(f"**{label}:** —")
+                continue
+            ap = row.get("airport") or "?"
+            score = row.get("overall_score")
+            lvl = row.get("challenge_level") or ""
+            cond = row.get("primary_condition") or ""
+            lines.append(f"**{label}:** `{ap}` · score **{score}** · {lvl} · {cond}")
+        gen = data.get("generated_at") or ""
+        embed = discord.Embed(
+            title="Spicy airports",
+            description="\n".join(lines),
+            color=discord.Color.red(),
+        )
+        if gen:
+            embed.set_footer(text=f"Generated: {gen}")
+        await interaction.followup.send(embed=embed)
+        return
+
+    # Region mode: use ranked list + weather score to produce a local "spicy" shortlist.
+    status, data = await _hub_get(
+        session,
+        "/api/airports/ranked",
+        hours="6",
+        limit="120",
+        include_unmanned="true",
+    )
     if status != 200:
         await interaction.followup.send(f"Hub returned **{status}**.", ephemeral=True)
         return
-    lines: list[str] = []
-    for label, key in (("Airliner", "airliner"), ("GA", "ga")):
-        row = data.get(key)
-        if not isinstance(row, dict):
-            lines.append(f"**{label}:** —")
+
+    rows = data.get("airports") or []
+    filtered: list[dict[str, Any]] = []
+    for r in rows:
+        icao = str(r.get("airport") or "").upper()
+        if not _airport_in_region(icao, region_key):
             continue
-        ap = row.get("airport") or "?"
-        score = row.get("overall_score")
-        lvl = row.get("challenge_level") or ""
-        cond = row.get("primary_condition") or ""
-        lines.append(f"**{label}:** `{ap}` · score **{score}** · {lvl} · {cond}")
-    gen = data.get("generated_at") or ""
+        overall = r.get("overall_score")
+        if overall is None:
+            continue
+        filtered.append(r)
+
+    filtered.sort(key=lambda x: float(x.get("overall_score") or 0), reverse=True)
+    top = filtered[:10]
+    if not top:
+        await interaction.followup.send("No spicy airports found for that region right now.")
+        return
+
+    lines = []
+    for r in top:
+        icao = str(r.get("airport") or "").upper()
+        score = r.get("overall_score")
+        lvl = r.get("challenge_level") or "—"
+        manned = "ATC online" if r.get("manned") else "no ATC"
+        lines.append(f"`{icao}` · score **{score}** · {lvl} · {manned}")
+
+    pretty_region = (region.name if region else "Region")
     embed = discord.Embed(
-        title="Spicy airports",
+        title=f"Spicy airports — {pretty_region}",
         description="\n".join(lines),
         color=discord.Color.red(),
     )
-    if gen:
-        embed.set_footer(text=f"Generated: {gen}")
+    embed.set_footer(text="Regional spicy list based on weather overall_score.")
     await interaction.followup.send(embed=embed)
 
 

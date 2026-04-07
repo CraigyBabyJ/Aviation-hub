@@ -133,7 +133,7 @@ Graceful shutdown:
 - AviationWeather TAF cache XML.GZ: every 30 minutes.
 - AviationWeather international SIGMET JSON: every 20 minutes.
 - OurAirports CSV sync: checked hourly, downloads only when 7 days have elapsed since last successful sync.
-- VATSIM public events JSON: default every 15 minutes (`VATSIM_EVENTS_POLL_SECONDS`, default `900`).
+- VATSIM public events JSON: default once per day (`VATSIM_EVENTS_POLL_SECONDS`, default `86400`).
 - VATSIM ATC bookings JSON: default every 5 minutes (`VATSIM_BOOKINGS_POLL_SECONDS`, default `300`).
 
 ### VATSIM events vs ATC bookings (scheduled / advisory)
@@ -149,10 +149,10 @@ Graceful shutdown:
 |----------|---------|--------|
 | `VATSIM_EVENTS_ENABLED` | `true` | Set to `false` to skip the events feed entirely. |
 | `VATSIM_BOOKINGS_ENABLED` | `true` | Set to `false` to skip bookings entirely. |
-| `VATSIM_EVENTS_URL` | `https://events.vatsim.net/v1/latest` | Override if VATSIM changes host or API version; confirm with [VATSIM Events API docs](https://vatsim.dev/api/events-api). |
+| `VATSIM_EVENTS_URL` | `https://my.vatsim.net/api/v2/events/latest` | Override if VATSIM changes host or API version; confirm with [VATSIM Events API docs](https://vatsim.dev/api/events-api). |
 | `VATSIM_BOOKINGS_URL` | `https://atc-bookings.vatsim.net/api/booking` | List endpoint; trailing slashes are trimmed. |
 | `VATSIM_BOOKINGS_API_KEY` | _(empty)_ | Optional **Bearer** token. The public `GET /api/booking` list works **without** a key; set this if you need authenticated access (e.g. filtered or `key_only` queries per [API docs](https://atc-bookings.vatsim.net/api-doc)). |
-| `VATSIM_EVENTS_POLL_SECONDS` | `900` | Minimum clamp `30`. |
+| `VATSIM_EVENTS_POLL_SECONDS` | `86400` | Minimum clamp `30`. |
 | `VATSIM_BOOKINGS_POLL_SECONDS` | `300` | Minimum clamp `30`. |
 
 **Assumptions**

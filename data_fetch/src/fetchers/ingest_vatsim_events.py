@@ -19,7 +19,7 @@ from util import json_dumps_compact, normalize_vatsim_api_time, utc_now_iso, wit
 LOGGER = logging.getLogger("aviation_hub.vatsim_events")
 FEED_NAME = "vatsim_events"
 
-DEFAULT_EVENTS_URL = "https://events.vatsim.net/v1/latest"
+DEFAULT_EVENTS_URL = "https://my.vatsim.net/api/v2/events/latest"
 
 
 def _truthy_env(name: str, default: bool = True) -> bool:

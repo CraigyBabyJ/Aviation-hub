@@ -1536,32 +1536,46 @@ def build_airports_upcoming_payload(
 ) -> dict[str, Any]:
     """
     Rank airports likely to be “busy soon” from ingested bookings + events in a forward window.
-    `busyness_score` = bookings + 2 * distinct_events (heuristic).
+    `busyness_score` = bookings + distinct_events (heuristic).
     """
     scores, now_m, win_end = _airport_upcoming_scores(conn, hours)
     ranked_list: list[dict[str, Any]] = []
     for ap, parts in scores.items():
         b = parts["bookings"]
         ev = parts["events"]
+        likely_staffed = b > 0
         ranked_list.append(
             {
                 "airport": ap,
                 "bookings": b,
                 "events": ev,
-                "busyness_score": b + 2 * ev,
+                "busyness_score": b + ev,
+                "likely_staffed": likely_staffed,
             }
         )
     ranked_list.sort(key=lambda x: (-x["busyness_score"], x["airport"]))
     top = ranked_list[:limit]
+    likely_staffed_rows = [r for r in top if bool(r.get("likely_staffed"))]
+    event_only_rows = [r for r in top if not bool(r.get("likely_staffed"))]
 
     return {
         "generated_at": utc_now_iso(),
         "hours": hours,
         "window_start_utc": now_m,
         "window_end_utc": win_end,
-        "note": "Heuristic from ingested bookings + events; bookings are advisory; overlap window [now, now+hours].",
+        "legend": {
+            "bookings": "Scheduled ATC position bookings overlapping the window.",
+            "events": "Published VATSIM events that include the airport and overlap the window.",
+            "busyness_score": "Simple heuristic: bookings + events.",
+            "likely_staffed": "True when bookings > 0 (bookings are advisory, not guaranteed online).",
+        },
+        "note": "Overlap window is [now, now+hours].",
         "count": len(top),
         "airports": top,
+        "groups": {
+            "likely_staffed": {"count": len(likely_staffed_rows), "airports": likely_staffed_rows},
+            "event_only": {"count": len(event_only_rows), "airports": event_only_rows},
+        },
     }
 
 
@@ -1620,7 +1634,7 @@ def build_airports_ranked_payload(
 
         up = upcoming.get(ap, {"bookings": 0, "events": 0})
         b, ev = up["bookings"], up["events"]
-        upcoming_score = b + 2 * ev
+        upcoming_score = b + ev
         ib = inb.get(ap, 0)
         os = float(lr["overall_score"] or 0) if lr is not None else 0.0
 

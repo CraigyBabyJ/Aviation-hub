@@ -175,7 +175,7 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
         TAF_FEED: PollState(interval=1800, next_run=0.0),
         SIGMET_FEED: PollState(interval=1200, next_run=0.0),
         VATSIM_EVENTS_FEED: PollState(
-            interval=_env_poll_seconds("VATSIM_EVENTS_POLL_SECONDS", 900),
+            interval=_env_poll_seconds("VATSIM_EVENTS_POLL_SECONDS", 86400),
             next_run=0.0,
         ),
         VATSIM_BOOKINGS_FEED: PollState(
