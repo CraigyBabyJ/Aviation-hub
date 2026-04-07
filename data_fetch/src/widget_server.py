@@ -1331,6 +1331,29 @@ def build_airport_brief_payload(
         ib = build_vatsim_inbounds_payload(conn, icao, limit=80)
         cap = 35
         plist = ib["pilots"]
+        dep_rows = conn.execute(
+            """
+            SELECT
+                callsign,
+                cid,
+                name,
+                groundspeed,
+                transponder,
+                heading,
+                flight_plan_aircraft,
+                flight_plan_departure,
+                flight_plan_arrival,
+                flight_plan_altitude,
+                flight_plan_rules,
+                logon_time,
+                last_updated
+            FROM vatsim_pilots_latest
+            WHERE UPPER(TRIM(COALESCE(flight_plan_departure, ''))) = ?
+            ORDER BY callsign COLLATE NOCASE
+            """,
+            (icao,),
+        ).fetchall()
+        dep_pilots = [_vatsim_pilot_row_to_dict(row) for row in dep_rows]
         inbounds_block = {
             "count": ib["count"],
             "match_field": ib["match_field"],
@@ -1338,6 +1361,9 @@ def build_airport_brief_payload(
             "pilots_sample": plist[:cap],
             "truncated": len(plist) > cap,
             "full_list_url_hint": f"/api/vatsim/inbounds?icao={icao}",
+            "departures_count": len(dep_pilots),
+            "departures_sample": dep_pilots[:cap],
+            "departures_truncated": len(dep_pilots) > cap,
         }
     except sqlite3.OperationalError as exc:
         LOGGER.warning("airport brief: inbounds unavailable: %s", exc)
@@ -1622,7 +1648,23 @@ def build_airports_ranked_payload(
     except sqlite3.OperationalError:
         pass
 
-    all_aps = set(live_by_ap.keys()) | set(upcoming.keys()) | set(inb.keys())
+    dep: dict[str, int] = {}
+    try:
+        for row in conn.execute(
+            """
+            SELECT UPPER(TRIM(flight_plan_departure)) AS ap, COUNT(*) AS c
+            FROM vatsim_pilots_latest
+            WHERE COALESCE(TRIM(flight_plan_departure), '') != ''
+            GROUP BY 1
+            """
+        ):
+            ap = (row["ap"] or "").strip().upper()
+            if len(ap) == 4 and ap.isalpha():
+                dep[ap] = int(row["c"] or 0)
+    except sqlite3.OperationalError:
+        pass
+
+    all_aps = set(live_by_ap.keys()) | set(upcoming.keys()) | set(inb.keys()) | set(dep.keys())
     rows_out: list[dict[str, Any]] = []
     for ap in sorted(all_aps):
         lr = live_by_ap.get(ap)
@@ -1636,12 +1678,14 @@ def build_airports_ranked_payload(
         b, ev = up["bookings"], up["events"]
         upcoming_score = b + ev
         ib = inb.get(ap, 0)
+        dp = dep.get(ap, 0)
         os = float(lr["overall_score"] or 0) if lr is not None else 0.0
 
         rank_score = (
             (100_000.0 if manned else 0.0)
             + 500.0 * min(cc, 20)
             + 50.0 * min(ib, 50)
+            + 40.0 * min(dp, 50)
             + 10.0 * upcoming_score
             + os
         )
@@ -1653,6 +1697,7 @@ def build_airports_ranked_payload(
                 "controller_count": cc,
                 "has_atis": bool(lr["has_atis"]) if lr is not None else False,
                 "inbounds": ib,
+                "departures": dp,
                 "upcoming_bookings": b,
                 "upcoming_events": ev,
                 "upcoming_score": upcoming_score,
@@ -1673,8 +1718,9 @@ def build_airports_ranked_payload(
         "window_end_utc": win_end,
         "include_unmanned": include_unmanned,
         "note": (
-            "rank_score = 100k if manned + 500*controllers + 50*inbounds + 10*upcoming_score + "
-            "weather overall_score; upcoming uses bookings+events in window; bookings advisory."
+            "rank_score = 100k if manned + 500*controllers + 50*inbounds + 40*departures + "
+            "10*upcoming_score + weather overall_score; upcoming uses bookings+events in window; "
+            "bookings advisory."
         ),
         "count": len(top),
         "airports": top,

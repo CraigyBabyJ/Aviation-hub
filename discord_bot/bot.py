@@ -557,7 +557,7 @@ async def cmd_summary(
 
 @bot.tree.command(
     name="upcoming",
-    description="Airports busy soon (bookings + events in the next hours, Aviation Hub)",
+    description="Schedule signal only: upcoming bookings/events by airport (next hours, Aviation Hub)",
 )
 @app_commands.describe(hours="Look-ahead hours (1–72)", limit="Max airports to list (1–40)")
 async def cmd_upcoming(
@@ -595,13 +595,13 @@ async def cmd_upcoming(
         ap = str(r.get("airport") or "").upper()
         b = int(r.get("bookings") or 0)
         e = int(r.get("events") or 0)
-        return f"`{ap}` · score **{r.get('busyness_score')}** (booked ATC positions: {b}, events: {e})"
+        return f"`{ap}` · ATC bookings: **{b}** · events: **{e}**"
 
     likely_staffed = [_fmt_upcoming_row(r) for r in likely_group]
     event_only = [_fmt_upcoming_row(r) for r in event_group]
 
     desc_parts = [
-        f"**How to read this**: `booked ATC positions` = scheduled controller slots in next **{hours}h**. `events` = published VATSIM events touching that airport.",
+        f"Scheduled activity in the next **{hours}h**.",
     ]
     if likely_staffed:
         desc_parts.append("**Likely staffed (bookings > 0)**\n" + "\n".join(likely_staffed))
@@ -620,7 +620,7 @@ async def cmd_upcoming(
 
 @bot.tree.command(
     name="ranked",
-    description="Airports by manned ATC + busyness (inbounds, upcoming, weather score, Aviation Hub)",
+    description="Best airports now: live ATC + filed traffic + upcoming + weather (Aviation Hub)",
 )
 @app_commands.describe(
     hours="Look-ahead hours for bookings/events (1–72)",
@@ -657,17 +657,30 @@ async def cmd_ranked(
     for r in rows:
         ap = r.get("airport")
         manned = "ATC" if r.get("manned") else "—"
+        cc = r.get("controller_count")
+        inb = r.get("inbounds")
+        dep = r.get("departures", 0)
+        up = r.get("upcoming_score")
+        up_b = r.get("upcoming_bookings", 0)
+        up_e = r.get("upcoming_events", 0)
+        rank_score = r.get("rank_score")
         lines.append(
-            f"`{ap}` · **{r.get('rank_score')}** · {manned} "
-            f"ctl={r.get('controller_count')} inb={r.get('inbounds')} "
-            f"up={r.get('upcoming_score')}"
+            f"`{ap}` · **rank {rank_score}** · {manned}\n"
+            f"Controllers online now: **{cc}** positions filled\n"
+            f"Filed traffic now: **{inb} arrivals** · **{dep} departures**\n"
+            f"Upcoming ({hours}h): ATC bookings **{up_b}** · events **{up_e}**"
         )
     embed = discord.Embed(
         title=f"Ranked — next {hours}h window",
-        description=_truncate("\n".join(lines), 3900),
+        description=_truncate(
+            "**How to read**: higher rank = more active/interesting now. "
+            "Filed traffic means online pilots whose flight plans include this airport.\n\n"
+            + "\n\n".join(lines),
+            3900,
+        ),
         color=discord.Color.teal(),
     )
-    embed.set_footer(text=(data.get("note") or "")[:200])
+    embed.set_footer(text="For exact controller callsigns/positions at one airport, use /airport ICAO.")
     await interaction.followup.send(embed=embed)
 
 
@@ -709,7 +722,7 @@ async def cmd_airport(
     wx = data.get("weather")
     if isinstance(wx, dict) and wx.get("metar"):
         metar = wx.get("metar") or ""
-        cat = wx.get("flight_category") or "—"
+        cat = wx.get("flight_category") or "unavailable"
         summary = wx.get("wx_summary") or ""
         embed.add_field(
             name="Weather (METAR)",
@@ -728,9 +741,7 @@ async def cmd_airport(
             name="Spicy / live snapshot",
             value=_truncate(
                 f"Score: **{score}** · {lvl}\n"
-                f"ATC online: **{sp.get('controller_count', 0)}** "
-                f"({'yes' if sp.get('has_atc') else 'no'}) · ATIS: "
-                f"{'yes' if sp.get('has_atis') else 'no'}",
+                f"ATIS: {'yes' if sp.get('has_atis') else 'no'}",
                 500,
             ),
             inline=False,
@@ -761,31 +772,44 @@ async def cmd_airport(
     ib = data.get("inbounds") or {}
     if ib.get("error"):
         embed.add_field(
-            name="Inbounds (filed arrival)",
+            name="Filed traffic (arrivals/departures)",
             value=f"Unavailable (`{ib['error']}`)",
             inline=False,
         )
     else:
-        icnt = ib.get("count", 0)
-        sample = ib.get("pilots_sample") or []
-        if icnt == 0:
+        icnt = int(ib.get("count", 0) or 0)
+        dcnt = int(ib.get("departures_count", 0) or 0)
+        arr_sample = ib.get("pilots_sample") or []
+        dep_sample = ib.get("departures_sample") or []
+        if icnt == 0 and dcnt == 0:
             embed.add_field(
-                name="Inbounds (filed arrival)",
-                value=f"**0** online pilots filed **`{code}`**.",
+                name="Filed traffic (arrivals/departures)",
+                value=f"**0 arrivals** · **0 departures** filed for **`{code}`**.",
                 inline=False,
             )
         else:
-            ilines = [f"**{icnt}** online · filed `flight_plan_arrival` = `{code}`"]
-            for p in sample[:10]:
-                dep = p.get("flight_plan_departure") or "?"
-                cs = p.get("callsign")
-                ac = (p.get("flight_plan_aircraft") or "").strip()
-                ilines.append(f"• `{cs}` {dep}→{code}" + (f" · {ac}" if ac else ""))
-            if ib.get("truncated"):
-                ilines.append("… `/inbounds` for full list")
+            flines = [f"**{icnt} arrivals** · **{dcnt} departures** filed for **`{code}`**"]
+            if arr_sample:
+                flines.append("Arrivals sample:")
+                for p in arr_sample[:5]:
+                    dep = p.get("flight_plan_departure") or "?"
+                    cs = p.get("callsign")
+                    ac = (p.get("flight_plan_aircraft") or "").strip()
+                    flines.append(f"• `{cs}` {dep}→{code}" + (f" · {ac}" if ac else ""))
+                if ib.get("truncated"):
+                    flines.append("… `/inbounds` for full arrivals list")
+            if dep_sample:
+                flines.append("Departures sample:")
+                for p in dep_sample[:5]:
+                    arr = p.get("flight_plan_arrival") or "?"
+                    cs = p.get("callsign")
+                    ac = (p.get("flight_plan_aircraft") or "").strip()
+                    flines.append(f"• `{cs}` {code}→{arr}" + (f" · {ac}" if ac else ""))
+                if ib.get("departures_truncated"):
+                    flines.append("… more departures in snapshot")
             embed.add_field(
-                name="Inbounds (sample)",
-                value=_truncate("\n".join(ilines), 900),
+                name="Filed traffic (arrivals/departures)",
+                value=_truncate("\n".join(flines), 900),
                 inline=False,
             )
 
