@@ -27,6 +27,7 @@ import json
 import logging
 import math
 import os
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlencode
 
@@ -38,11 +39,21 @@ from discord.ext import commands
 LOG = logging.getLogger("aviation_hub.discord")
 
 
-def _normalize_discord_bot_token(raw: str | None) -> str:
-    """Strip whitespace and optional surrounding quotes (common in .env / copy-paste)."""
+def _normalize_snowflake_env(raw: str | None) -> str:
+    """Strip .env junk from numeric Discord IDs (guild, etc.)."""
     if not raw:
         return ""
-    t = raw.strip()
+    t = raw.replace("\ufeff", "").replace("\r", "").strip()
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in ("'", '"'):
+        t = t[1:-1].strip()
+    return t
+
+
+def _normalize_discord_bot_token(raw: str | None) -> str:
+    """Strip whitespace, BOM, CR, optional quotes (common in .env / Windows copy-paste)."""
+    if not raw:
+        return ""
+    t = raw.replace("\ufeff", "").replace("\r", "").strip()
     if len(t) >= 2 and t[0] == t[-1] and t[0] in ("'", '"'):
         t = t[1:-1].strip()
     if t.lower().startswith("bot "):
@@ -108,10 +119,37 @@ def _truncate(text: str | None, max_len: int = 350) -> str:
     return t[: max_len - 1] + "…"
 
 
+_HELP_DESC_SUFFIXES = (
+    " (Aviation Hub)",
+    " (Aviation Hub DB)",
+    " (Aviation Hub snapshot)",
+)
+
+
+def _help_tidy_description(desc: str | None) -> str:
+    d = (desc or "").strip() or "—"
+    for suf in _HELP_DESC_SUFFIXES:
+        if d.endswith(suf):
+            d = d[: -len(suf)].rstrip()
+    return d
+
+
+def _help_embed_field_lines(cmds: list[app_commands.AppCommand]) -> str:
+    lines = [
+        f"**`/{c.name}`** · {_help_tidy_description(c.description)}"
+        for c in sorted(cmds, key=lambda x: x.name)
+    ]
+    return "\n".join(lines)
+
+
 class AviationHubBot(commands.Bot):
     def __init__(self) -> None:
-        # Slash-only; no privileged intents required.
-        super().__init__(command_prefix="!", intents=discord.Intents.default())
+        # Slash-only: no prefix commands (avoids confusing default `!help` vs `/help`).
+        super().__init__(
+            command_prefix=lambda _bot, _message: [],
+            intents=discord.Intents.default(),
+            help_command=None,
+        )
         self.http_session: aiohttp.ClientSession | None = None
 
     async def setup_hook(self) -> None:
@@ -119,6 +157,41 @@ class AviationHubBot(commands.Bot):
             headers={"User-Agent": "AviationHubDiscord/1.0"},
             timeout=aiohttp.ClientTimeout(total=45),
         )
+        # Sync once per process start (avoid repeating on every reconnect in on_ready → rate limits).
+        guild_raw = _normalize_snowflake_env(os.environ.get("DISCORD_GUILD_ID"))
+        try:
+            if guild_raw:
+                guild = discord.Object(id=int(guild_raw))
+                # Guild sync only uploads *guild* command entries; @bot.tree.command registers globals.
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                LOG.info(
+                    "Slash commands synced to guild %s (%s commands). "
+                    "If commands are missing in other servers, unset DISCORD_GUILD_ID for global sync.",
+                    guild.id,
+                    len(synced),
+                )
+            else:
+                synced = await self.tree.sync()
+                LOG.info(
+                    "Slash commands synced globally (%s commands). "
+                    "They can take up to ~1 hour to appear; set DISCORD_GUILD_ID for instant sync in one server.",
+                    len(synced),
+                )
+        except discord.HTTPException as exc:
+            detail = getattr(exc, "text", None) or str(exc)
+            LOG.error(
+                "Slash sync failed: HTTP %s — fix DISCORD_GUILD_ID, invite the bot to that server, "
+                "and re‑invite with scopes bot + applications.commands. Detail: %s",
+                exc.status,
+                (detail[:500] + "…") if len(detail) > 500 else detail,
+            )
+        except Exception:
+            LOG.exception(
+                "Slash command sync failed — commands may not appear. "
+                "Check DISCORD_GUILD_ID matches your server (right‑click server → Copy Server ID, Developer Mode on). "
+                "Ensure the bot was invited with **applications.commands** scope."
+            )
 
     async def close(self) -> None:
         if self.http_session:
@@ -132,17 +205,38 @@ bot = AviationHubBot()
 @bot.event
 async def on_ready() -> None:
     LOG.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "")
-    guild_raw = os.environ.get("DISCORD_GUILD_ID")
-    try:
-        if guild_raw:
-            guild = discord.Object(id=int(guild_raw))
-            synced = await bot.tree.sync(guild=guild)
-            LOG.info("Slash commands synced to guild %s (%s commands)", guild.id, len(synced))
+    guild_raw = _normalize_snowflake_env(os.environ.get("DISCORD_GUILD_ID"))
+    if guild_raw:
+        try:
+            gid = int(guild_raw)
+        except ValueError:
+            LOG.error("DISCORD_GUILD_ID must be digits only after cleanup; got: %r", guild_raw)
+            return
+        g = bot.get_guild(gid)
+        if g is None:
+            LOG.error(
+                "Bot is **not a member** of server id=%s — slash commands will not show there. "
+                "Invite this bot to that Discord server, or set DISCORD_GUILD_ID to a server the bot has joined.",
+                gid,
+            )
         else:
-            synced = await bot.tree.sync()
-            LOG.info("Slash commands synced globally (%s commands)", len(synced))
+            LOG.info("Bot is in target guild: %s (id=%s)", g.name, g.id)
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+    LOG.exception("Slash command failed: %s", interaction.command)
+    msg = "Command failed (see server logs). If API commands break, check the hub is running and `AVIATION_HUB_BASE_URL`."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
     except Exception:
-        LOG.exception("Failed to sync slash commands")
+        LOG.exception("Could not send slash error message to Discord")
 
 
 @bot.tree.command(
@@ -828,14 +922,49 @@ async def cmd_vatsim(interaction: discord.Interaction, query: str) -> None:
     description="Show every slash command and its description",
 )
 async def cmd_help(interaction: discord.Interaction) -> None:
-    cmds = sorted(bot.tree.get_commands(), key=lambda c: c.name)
-    lines = [f"`/{cmd.name}` — {(cmd.description or '').strip() or '—'}" for cmd in cmds]
+    cmds = list(bot.tree.get_commands())
+    by_name = {c.name: c for c in cmds}
+
+    weather_airport_names = ("airport", "metar", "spicy", "summary", "weather")
+    vatsim_names = ("bookings", "events", "inbounds", "ranked", "upcoming", "vatsim")
+    meta_names = ("help", "info", "ping")
+
+    def pick(names: tuple[str, ...]) -> list[app_commands.AppCommand]:
+        return [by_name[n] for n in names if n in by_name]
+
+    weather_cmds = pick(weather_airport_names)
+    vatsim_cmds = pick(vatsim_names)
+    meta_cmds = pick(meta_names)
+    known = set(weather_airport_names) | set(vatsim_names) | set(meta_names)
+    other_cmds = [c for c in cmds if c.name not in known]
+
     embed = discord.Embed(
-        title="Aviation Hub — slash commands",
-        description=_truncate("\n".join(lines), 3900),
-        color=discord.Color.blurple(),
+        title="AvBot · slash commands",
+        description="Type **`/`** and start typing to filter. Most commands need the **Aviation Hub** service running on your machine.",
+        color=discord.Color.from_rgb(52, 152, 219),
+        timestamp=datetime.now(timezone.utc),
     )
-    embed.set_footer(text=f"Widget / API base: {_hub_base()}")
+    embed.add_field(
+        name="Weather & airports",
+        value=_truncate(_help_embed_field_lines(weather_cmds), 1024) or "—",
+        inline=False,
+    )
+    embed.add_field(
+        name="VATSIM & traffic",
+        value=_truncate(_help_embed_field_lines(vatsim_cmds), 1024) or "—",
+        inline=False,
+    )
+    embed.add_field(
+        name="Bot",
+        value=_truncate(_help_embed_field_lines(meta_cmds), 1024) or "—",
+        inline=False,
+    )
+    if other_cmds:
+        embed.add_field(
+            name="Other",
+            value=_truncate(_help_embed_field_lines(other_cmds), 1024),
+            inline=False,
+        )
     await interaction.response.send_message(embed=embed)
 
 
@@ -898,11 +1027,16 @@ def main() -> int:
     try:
         bot.run(token)
     except discord.LoginFailure as exc:
+        dots = token.count(".")
         LOG.error(
-            "Discord rejected the token (%s). Use **Bot → Token** in the Developer Portal, not the "
-            "OAuth2 **Client Secret**. In discord_bot/.env use `DISCORD_BOT_TOKEN=...` with **no** quotes; "
-            "if you reset the token, paste the new value and `sudo systemctl restart aviation-hub-bot`.",
+            "Discord rejected the token (%s). Safe checks: length=%s, dot_count=%s (a real **Bot** token "
+            "is usually ~68–72 chars with **exactly 2** dots / three segments). Use Portal → **Bot** → "
+            "**Token**, not OAuth2 **Client Secret**. In `.env`: `DISCORD_BOT_TOKEN=...` one line, no quotes, "
+            "no spaces around `=`. Confirm systemd uses EnvironmentFile= that same file. "
+            "Stop the loop: `sudo systemctl stop aviation-hub-bot` until the token is fixed.",
             exc,
+            len(token),
+            dots,
         )
         return 1
     except Exception:

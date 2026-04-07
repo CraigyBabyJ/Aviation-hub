@@ -547,6 +547,12 @@ journalctl -u aviation-hub.service -f
 journalctl -u aviation-hub-bot.service -f
 ```
 
+Discord bot **`Improper token` / `LoginFailure`**: the string in **`discord_bot/.env`** is not a valid **Bot** token (often the OAuth2 **Client Secret** was pasted by mistake). Bot tokens are usually **~68–72 characters** with **two** dots (three segments). Run `python3 discord_bot/verify_env.py` for safe diagnostics (length/segment count; it never prints the token). While fixing, `sudo systemctl stop aviation-hub-bot` to stop restart spam; after editing `.env`, `sudo systemctl reset-failed aviation-hub-bot` then `sudo systemctl start aviation-hub-bot` (the unit limits bursts after repeated failures). Ensure **`EnvironmentFile=`** in the installed unit points at the same `.env` you edit.
+
+**Slash commands missing or “not working”:** (1) Re-invite the bot with scopes **`bot`** and **`applications.commands`** (see `/info` or the OAuth URL in the README). (2) If **`DISCORD_GUILD_ID`** is set, the bot **copies global slash commands to that guild** then syncs (discord.py guild sync would otherwise register **zero** commands). After restart, logs should show `synced to guild … (N commands)` with a **non-zero** N. (3) With **`DISCORD_GUILD_ID`** unset, **global** sync can take **up to ~1 hour**. (4) If commands run but return errors, run the **Aviation Hub** widget and check **`AVIATION_HUB_BASE_URL`**; see `journalctl -u aviation-hub-bot`.
+
+**Privileged message content intent** warning in logs: harmless for this **slash-only** bot; you can ignore it or enable **Message Content Intent** in the Portal if you want the warning gone.
+
 Check per-feed health:
 
 ```bash

@@ -16,6 +16,9 @@ ExecStart=/home/craig/projects/Aviation-hub/discord_bot/.venv/bin/python /home/c
 
 Restart=on-failure
 RestartSec=15
+# Avoid endless restart spam while the token is wrong (requires: systemctl reset-failed after fix).
+StartLimitBurst=5
+StartLimitIntervalSec=120
 # Load DISCORD_BOT_TOKEN, AVIATION_HUB_BASE_URL, etc. (KEY=value lines, no "export")
 EnvironmentFile=-/home/craig/projects/Aviation-hub/discord_bot/.env
 
