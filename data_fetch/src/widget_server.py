@@ -984,14 +984,28 @@ def build_vatsim_events_list_payload(
     VATSIM published events from `vatsim_events_latest` (ingested snapshot).
 
     Overlap rule: event is included if it has not ended yet (`end_time_utc >= now`) and, when
-    `days_ahead` is set, its start is on or before `now + days_ahead` (events starting later are
-    excluded). Use `days_ahead=None` for no upper bound on start time.
+    `days_ahead` is set, its start is on or before the end of the server-local calendar window:
+    - `days_ahead=1`: today only (until 23:59:59Z)
+    - `days_ahead=2`: today + tomorrow
+    Use `days_ahead=None` for no upper bound on start time.
     """
     now_marker = utc_now_iso().replace("+00:00", "Z")
     window_end_marker: str | None = None
     if days_ahead is not None:
-        window_end = datetime.now(timezone.utc) + timedelta(days=days_ahead)
-        window_end_marker = window_end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        local_now = datetime.now().astimezone()
+        day_span = max(1, int(days_ahead))
+        # End of server-local calendar day window (inclusive): today + (day_span - 1) days at 23:59:59.
+        window_end_local = datetime(
+            local_now.year,
+            local_now.month,
+            local_now.day,
+            23,
+            59,
+            59,
+            tzinfo=local_now.tzinfo,
+        ) + timedelta(days=day_span - 1)
+        window_end_utc = window_end_local.astimezone(timezone.utc)
+        window_end_marker = window_end_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     if window_end_marker is None:
         rows = conn.execute(
@@ -1337,6 +1351,11 @@ def build_airport_brief_payload(
                 callsign,
                 cid,
                 name,
+                server,
+                pilot_rating,
+                latitude,
+                longitude,
+                altitude,
                 groundspeed,
                 transponder,
                 heading,

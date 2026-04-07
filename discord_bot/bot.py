@@ -170,6 +170,13 @@ def _iso_utc_date(value: str | None) -> str | None:
         return None
 
 
+def _format_online_since(logon_time_utc: str | None) -> str:
+    ts = _iso_to_unix(logon_time_utc)
+    if ts:
+        return f"<t:{ts}:R>"
+    return "unknown"
+
+
 _SPICY_REGION_PREFIXES: dict[str, tuple[str, ...]] = {
     "europe": ("E", "L", "U"),
     "asia": ("R", "V", "W", "Z", "O", "H"),
@@ -227,6 +234,20 @@ class AviationHubBot(commands.Bot):
             timeout=aiohttp.ClientTimeout(total=45),
         )
         # Sync once per process start (avoid repeating on every reconnect in on_ready → rate limits).
+        # Always sync globals so slash commands are available in DMs.
+        try:
+            global_synced = await self.tree.sync()
+            LOG.info("Slash commands synced globally (%s commands).", len(global_synced))
+        except discord.HTTPException as exc:
+            detail = getattr(exc, "text", None) or str(exc)
+            LOG.error(
+                "Global slash sync failed: HTTP %s. Detail: %s",
+                exc.status,
+                (detail[:500] + "…") if len(detail) > 500 else detail,
+            )
+        except Exception:
+            LOG.exception("Global slash command sync failed.")
+
         guild_raw = _normalize_snowflake_env(os.environ.get("DISCORD_GUILD_ID"))
         try:
             if guild_raw:
@@ -236,16 +257,14 @@ class AviationHubBot(commands.Bot):
                 synced = await self.tree.sync(guild=guild)
                 LOG.info(
                     "Slash commands synced to guild %s (%s commands). "
-                    "If commands are missing in other servers, unset DISCORD_GUILD_ID for global sync.",
+                    "Global sync remains enabled for DMs/other servers.",
                     guild.id,
                     len(synced),
                 )
             else:
-                synced = await self.tree.sync()
                 LOG.info(
-                    "Slash commands synced globally (%s commands). "
-                    "They can take up to ~1 hour to appear; set DISCORD_GUILD_ID for instant sync in one server.",
-                    len(synced),
+                    "No DISCORD_GUILD_ID set; using global commands for servers/DMs "
+                    "(may take up to ~1 hour to propagate)."
                 )
         except discord.HTTPException as exc:
             detail = getattr(exc, "text", None) or str(exc)
@@ -758,7 +777,9 @@ async def cmd_airport(
     v_lines = []
     for c in ctrls[:12]:
         fac = c.get("facility_label") or c.get("facility")
-        v_lines.append(f"• `{c.get('callsign')}` {fac}")
+        name = c.get("name") or "Unknown"
+        since = _format_online_since(c.get("logon_time"))
+        v_lines.append(f"• `{c.get('callsign')}` {fac} · {name} · online {since}")
     if not v_lines:
         v_lines.append("No ATC positions online right now.")
     if len(ctrls) > 12:
