@@ -1,0 +1,164 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #050505;
+  --panel: rgba(20, 20, 20, 0.7);
+  --panel-solid: #111111;
+  --text: #ffffff;
+  --muted: #9ca3af;
+  --line: rgba(255, 255, 255, 0.08);
+  --glow: rgba(255, 255, 255, 0.25);
+  --red: #dc2626;
+  --red-dim: rgba(220, 38, 38, 0.15);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background-color: var(--bg);
+}
+
+body {
+  background-color: var(--bg);
+  background-image:
+    /* bottom radial glow */
+    radial-gradient(ellipse 100% 60% at 50% 100%, rgba(255, 255, 255, 0.03) 0%, transparent 70%),
+    /* subtle top glow */
+    radial-gradient(ellipse 60% 30% at 50% 0%, rgba(220, 38, 38, 0.04) 0%, transparent 60%),
+    /* noise texture via SVG data URI */
+    url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+  background-attachment: fixed;
+  color: var(--text);
+  min-height: 100vh;
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Diagonal line overlay — applied on a pseudo via utility class */
+.bg-grid-lines {
+  background-image:
+    repeating-linear-gradient(
+      -45deg,
+      transparent,
+      transparent 40px,
+      rgba(255, 255, 255, 0.012) 40px,
+      rgba(255, 255, 255, 0.012) 41px
+    );
+}
+
+/* HubPanel glass base */
+.hub-panel {
+  background: var(--panel);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.04),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  position: relative;
+  overflow: hidden;
+}
+
+.hub-panel::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 0%, transparent 40%);
+  pointer-events: none;
+  border-radius: inherit;
+}
+
+.hub-panel:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+  box-shadow:
+    0 0 28px rgba(255, 255, 255, 0.05),
+    0 0 0 1px rgba(255, 255, 255, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  transition: box-shadow 0.3s ease, border-color 0.3s ease;
+}
+
+/* Corner accent marks */
+.corner-accent::after,
+.corner-accent::before {
+  content: '';
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border-color: rgba(220, 38, 38, 0.6);
+  border-style: solid;
+}
+
+.corner-accent::before {
+  top: 0;
+  left: 0;
+  border-width: 1px 0 0 1px;
+  border-radius: 0.75rem 0 0 0;
+}
+
+.corner-accent::after {
+  bottom: 0;
+  right: 0;
+  border-width: 0 1px 1px 0;
+  border-radius: 0 0 0.75rem 0;
+}
+
+/* Live indicator pulse */
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.85); }
+}
+
+.live-dot {
+  animation: live-pulse 2s ease-in-out infinite;
+}
+
+/* Radar scan line */
+@keyframes radar-sweep {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.radar-sweep {
+  animation: radar-sweep 4s linear infinite;
+  transform-origin: center;
+}
+
+/* Table row hover */
+.hub-row {
+  border-bottom: 1px solid var(--line);
+  transition: background 0.15s ease;
+}
+
+.hub-row:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* MapLibre overrides */
+.maplibregl-ctrl-bottom-left,
+.maplibregl-ctrl-bottom-right,
+.maplibregl-ctrl-top-left,
+.maplibregl-ctrl-top-right {
+  display: none;
+}

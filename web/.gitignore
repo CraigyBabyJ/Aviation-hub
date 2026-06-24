@@ -1,0 +1,9 @@
+.next/
+node_modules/
+out/
+.env
+.env.local
+.env*.local
+
+# TS build cache
+*.tsbuildinfo
