@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Aviation Hub Discord bot (AvBot): slash commands that read from the local widget HTTP API
+Aviation Hub Discord bot: slash commands that read from the local widget HTTP API
 (same JSON as `data_fetch/src/widget_server.py` serves alongside the ingestor).
 
 Environment:
@@ -9,14 +9,14 @@ Environment:
   DISCORD_GUILD_ID        — optional; sync slash commands to this guild only (faster while testing)
 
   /info invite & support (optional):
-  AVBOT_ADD_BOT_URL       — full OAuth2 “add bot” URL; overrides auto-built link
+  AVIATION_HUB_ADD_BOT_URL       — full OAuth2 “add bot” URL; overrides auto-built link
   DISCORD_APPLICATION_ID  — Application ID (same as OAuth client_id); used to build add-bot link if
-                            AVBOT_ADD_BOT_URL is unset
+                            AVIATION_HUB_ADD_BOT_URL is unset
   DISCORD_CLIENT_ID       — alias for DISCORD_APPLICATION_ID (either may be set)
-  AVBOT_SUPPORT_SERVER_URL — support Discord invite (e.g. https://discord.gg/…)
+  AVIATION_HUB_SUPPORT_SERVER_URL — support Discord invite (e.g. https://discord.gg/…)
 
 Utility slash commands (no hub call): /help lists every command’s description from this tree; /info
-shows AvBot text and the invite links above; /ping shows Discord gateway latency.
+shows Aviation Hub text and the invite links above; /ping shows Discord gateway latency.
 
 Discord Developer Portal:
   • **Public Key** — not used here (gateway bot, not an interactions HTTP endpoint).
@@ -68,9 +68,9 @@ def _hub_base() -> str:
 
 
 
-def _avbot_add_invite_url() -> str | None:
+def _hub_add_invite_url() -> str | None:
     """Full OAuth invite, or built from Application ID + default permissions."""
-    url = os.environ.get("AVBOT_ADD_BOT_URL", "").strip()
+    url = os.environ.get("AVIATION_HUB_ADD_BOT_URL", "").strip()
     if url:
         return url
     app_id = (
@@ -87,8 +87,8 @@ def _avbot_add_invite_url() -> str | None:
     )
 
 
-def _avbot_support_server_url() -> str | None:
-    u = os.environ.get("AVBOT_SUPPORT_SERVER_URL", "").strip()
+def _hub_support_server_url() -> str | None:
+    u = os.environ.get("AVIATION_HUB_SUPPORT_SERVER_URL", "").strip()
     return u or None
 
 
@@ -1644,7 +1644,7 @@ async def cmd_help(interaction: discord.Interaction) -> None:
     other_cmds = [c for c in cmds if c.name not in known]
 
     embed = discord.Embed(
-        title="AvBot · slash commands",
+        title="Aviation Hub · slash commands",
         description="Type **`/`** and start typing to filter. Most commands need the **Aviation Hub** service running on your machine.",
         color=discord.Color.from_rgb(52, 152, 219),
         timestamp=datetime.now(timezone.utc),
@@ -1685,32 +1685,32 @@ async def cmd_help(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(
     name="info",
-    description="About AvBot, plus links to add the bot and join the support server",
+    description="About Aviation Hub, plus links to add the bot and join the support server",
 )
 async def cmd_info(interaction: discord.Interaction) -> None:
     lines = [
-        "**AvBot** is the Aviation Hub Discord client: slash commands call your local **widget HTTP API** "
+        "**Aviation Hub** is the Discord client: slash commands call your local **widget HTTP API** "
         "(METAR, VATSIM pilots/controllers lookup, events, bookings, airport summaries, and more).",
         "",
         f"**Hub base URL** (this bot): `{_hub_base()}`",
         "",
     ]
-    add = _avbot_add_invite_url()
+    add = _hub_add_invite_url()
     if add:
-        lines.append(f"**Add AvBot:** [Invite link]({add})")
+        lines.append(f"**Add Aviation Hub:** [Invite link]({add})")
     else:
         lines.append(
-            "**Add AvBot:** set **`AVBOT_ADD_BOT_URL`** (full OAuth URL) or **`DISCORD_APPLICATION_ID`** "
+            "**Add Aviation Hub:** set **`AVIATION_HUB_ADD_BOT_URL`** (full OAuth URL) or **`DISCORD_APPLICATION_ID`** "
             "on the bot host to show an invite."
         )
-    sup = _avbot_support_server_url()
+    sup = _hub_support_server_url()
     if sup:
         lines.append(f"**Support server:** [Join]({sup})")
     else:
-        lines.append("**Support server:** set **`AVBOT_SUPPORT_SERVER_URL`** on the bot host (e.g. `https://discord.gg/…`).")
+        lines.append("**Support server:** set **`AVIATION_HUB_SUPPORT_SERVER_URL`** on the bot host (e.g. `https://discord.gg/…`).")
 
     embed = discord.Embed(
-        title="AvBot — Aviation Hub",
+        title="Aviation Hub",
         description=_truncate("\n".join(lines), 3900),
         color=discord.Color.green(),
     )
@@ -1719,7 +1719,7 @@ async def cmd_info(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(
     name="ping",
-    description="Check AvBot's ping to the Discord server (gateway latency)",
+    description="Check Aviation Hub's ping to the Discord server (gateway latency)",
 )
 async def cmd_ping(interaction: discord.Interaction) -> None:
     lat = bot.latency

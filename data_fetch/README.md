@@ -471,7 +471,7 @@ export DISCORD_BOT_TOKEN='your bot token'   # Bot → Token (not Application ID 
 python bot.py
 ```
 
-Portal: **Public Key** is not used (gateway bot). **Application ID** is optional: with `DISCORD_APPLICATION_ID` (or `DISCORD_CLIENT_ID`), `/info` can show a default **add-bot** OAuth link when `AVBOT_ADD_BOT_URL` is unset. Only the **bot token** is required. See `discord_bot/.env.example`; keep secrets in `discord_bot/.env` (gitignored).
+Portal: **Public Key** is not used (gateway bot). **Application ID** is optional: with `DISCORD_APPLICATION_ID` (or `DISCORD_CLIENT_ID`), `/info` can show a default **add-bot** OAuth link when `AVIATION_HUB_ADD_BOT_URL` is unset. Only the **bot token** is required. See `discord_bot/.env.example`; keep secrets in `discord_bot/.env` (gitignored).
 
 Slash commands (after `bot.py` syncs to Discord, **`/help`** lists the same descriptions live):
 
@@ -482,7 +482,7 @@ Slash commands (after `bot.py` syncs to Discord, **`/help`** lists the same desc
 | `/events` | VATSIM events → `/api/vatsim/events` |
 | `/help` | Every command name + description (from the command tree) |
 | `/inbounds` | Pilots filed to an ICAO → `/api/vatsim/inbounds` |
-| `/info` | About AvBot; add-bot + support links from env |
+| `/info` | About Aviation Hub; add-bot + support links from env |
 | `/metar` | Raw METAR → `/api/metar` |
 | `/ping` | Discord gateway latency (websocket RTT) |
 | `/ranked` | Airports by manned ATC + busyness → `/api/airports/ranked` |
