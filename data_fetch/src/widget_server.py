@@ -14,11 +14,11 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from typing import Any
 
 from db import DB_PATH
-from util import configure_logging, utc_now_iso
+from util import configure_logging, extract_airport_from_callsign, utc_now_iso
 
 LOGGER = logging.getLogger("aviation_hub.widget")
 WIDGET_PATH = "/widgets/current-spicy-airports"
@@ -32,11 +32,14 @@ AIRPORT_VATSIM_PATH = "/api/airport/vatsim"
 AIRPORT_SUMMARY_PATH = "/api/airport/summary"
 AIRPORTS_UPCOMING_PATH = "/api/airports/upcoming"
 AIRPORTS_RANKED_PATH = "/api/airports/ranked"
+VATSIM_AIRPORTS_PATH = "/api/vatsim/airports"
+VATSIM_ROUTES_PATH = "/api/vatsim/routes"
 VATSIM_AIRPORT_PATH = "/api/vatsim/airport"
 VATSIM_EVENTS_PATH = "/api/vatsim/events"
 VATSIM_BOOKINGS_PATH = "/api/vatsim/bookings"
 VATSIM_INBOUNDS_PATH = "/api/vatsim/inbounds"
 VATSIM_LOOKUP_PATH = "/api/vatsim/lookup"
+IVAO_AIRPORT_PATH = "/api/ivao/airport"
 AIRPORT_BRIEF_PATH = "/api/airport/brief"
 SIGMETS_PATH = "/api/sigmets"
 AIRPORT_RUNWAYS_PATH = "/api/airport/runways"
@@ -53,6 +56,8 @@ HTTP_ROUTES = {
     "airport_summary": AIRPORT_SUMMARY_PATH,
     "airports_upcoming": AIRPORTS_UPCOMING_PATH,
     "airports_ranked": AIRPORTS_RANKED_PATH,
+    "vatsim_airports": VATSIM_AIRPORTS_PATH,
+    "vatsim_routes": VATSIM_ROUTES_PATH,
     "vatsim_airport": VATSIM_AIRPORT_PATH,
     "vatsim_events": VATSIM_EVENTS_PATH,
     "vatsim_bookings": VATSIM_BOOKINGS_PATH,
@@ -75,6 +80,32 @@ _FACILITY_LABELS: dict[int, str] = {
     6: "CTR",
 }
 
+_COVERAGE_FACILITY_FLAGS: dict[int, str] = {
+    2: "hasDel",
+    3: "hasGnd",
+    4: "hasTwr",
+    5: "hasApp",
+    6: "hasCtr",
+}
+
+_COVERAGE_FILTER_PARAM_MAP: dict[str, str] = {
+    "has_del": "hasDel",
+    "has_gnd": "hasGnd",
+    "has_twr": "hasTwr",
+    "has_app": "hasApp",
+    "has_ctr": "hasCtr",
+    "has_atis": "hasAtis",
+    "has_any_atc": "hasAnyAtc",
+    "has_ground_ops": "hasGroundOps",
+    "has_radar": "hasRadar",
+    "full_coverage": "fullCoverage",
+    "tower": "hasTwr",
+    "ground_ops": "hasGroundOps",
+    "radar": "hasRadar",
+    "atis": "hasAtis",
+    "any_atc": "hasAnyAtc",
+}
+
 
 def _facility_label(facility: object) -> str:
     if facility is None or facility == "":
@@ -84,6 +115,70 @@ def _facility_label(facility: object) -> str:
     except (TypeError, ValueError):
         return "ATC"
     return _FACILITY_LABELS.get(key, f"Facility {key}")
+
+
+def _empty_coverage_flags() -> dict[str, bool]:
+    return {
+        "hasDel": False,
+        "hasGnd": False,
+        "hasTwr": False,
+        "hasApp": False,
+        "hasCtr": False,
+        "hasAtis": False,
+        "hasAnyAtc": False,
+        "hasGroundOps": False,
+        "hasRadar": False,
+        "fullCoverage": False,
+    }
+
+
+def _finalize_coverage_flags(flags: dict[str, bool]) -> dict[str, bool]:
+    finalized = _empty_coverage_flags()
+    finalized.update(flags)
+    finalized["hasAnyAtc"] = any(
+        finalized[key] for key in ("hasDel", "hasGnd", "hasTwr", "hasApp", "hasCtr")
+    )
+    finalized["hasGroundOps"] = finalized["hasDel"] or finalized["hasGnd"]
+    finalized["hasRadar"] = finalized["hasApp"] or finalized["hasCtr"]
+    finalized["fullCoverage"] = (
+        finalized["hasGroundOps"] and finalized["hasTwr"] and finalized["hasRadar"]
+    )
+    return finalized
+
+
+def _coverage_flags_from_controllers_and_atis(
+    controllers: list[dict[str, Any]],
+    atis_list: list[dict[str, Any]],
+) -> dict[str, bool]:
+    flags = _empty_coverage_flags()
+    for controller in controllers:
+        key = _COVERAGE_FACILITY_FLAGS.get(int(controller.get("facility") or 0))
+        if key:
+            flags[key] = True
+    flags["hasAtis"] = len(atis_list) > 0
+    return _finalize_coverage_flags(flags)
+
+
+def _coverage_score(flags: dict[str, bool], controller_count: int, atis_count: int) -> int:
+    score = 0
+    score += 100 if flags["fullCoverage"] else 0
+    score += 20 if flags["hasCtr"] else 0
+    score += 16 if flags["hasApp"] else 0
+    score += 14 if flags["hasTwr"] else 0
+    score += 10 if flags["hasGnd"] else 0
+    score += 8 if flags["hasDel"] else 0
+    score += 4 if flags["hasAtis"] else 0
+    score += min(controller_count, 20)
+    score += min(atis_count, 5)
+    return score
+
+
+_ROUTE_REGION_LABELS: dict[str, str] = {
+    "uk": "UK",
+    "europe": "Europe",
+    "us": "US",
+    "south_usa": "South USA",
+}
 _METAR_CLOUD_LAYER_RE = re.compile(
     r"(?<!\S)(FEW|SCT|BKN|OVC|VV|///)(\d{3}|///)(CB|TCU|///)?(?!\S)"
 )
@@ -480,6 +575,18 @@ def _parse_limit_from_query(query: str, *, default: int, max_limit: int) -> int:
     return max(1, min(max_limit, value))
 
 
+def _parse_minutes_from_query(query: str, *, default: int, min_minutes: int, max_minutes: int) -> int:
+    params = parse_qs(query)
+    raw = (params.get("minutes", [""])[0] or params.get("duration_minutes", [""])[0] or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(min_minutes, min(max_minutes, value))
+
+
 def _parse_bookings_limit_from_query(query: str, *, default: int = 15, max_limit: int = 25) -> int:
     params = parse_qs(query)
     raw = (params.get("bookings_limit", [""])[0] or "").strip()
@@ -502,6 +609,24 @@ def _parse_bool_query(query: str, name: str, *, default: bool = True) -> bool:
     if raw in ("0", "false", "no", "off"):
         return False
     return default
+
+
+def _parse_sort_query(query: str, name: str, *, default: str, allowed: set[str]) -> str:
+    params = parse_qs(query)
+    raw = (params.get(name, [""])[0] or "").strip().lower()
+    if not raw or raw not in allowed:
+        return default
+    return raw
+
+
+def _parse_coverage_filters_from_query(query: str) -> dict[str, bool]:
+    params = parse_qs(query)
+    filters: dict[str, bool] = {}
+    for param_name, coverage_name in _COVERAGE_FILTER_PARAM_MAP.items():
+        raw = (params.get(param_name, [""])[0] or "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            filters[coverage_name] = True
+    return filters
 
 
 def _parse_hours_from_query(query: str, *, default: int, max_hours: int) -> int:
@@ -737,25 +862,36 @@ def build_airport_status_payload(conn: sqlite3.Connection, icao: str) -> dict[st
     }
 
 
-def build_vatsim_airport_payload(conn: sqlite3.Connection, icao: str) -> dict[str, Any]:
-    """
-    VATSIM online controllers and ATIS for an airport prefix (e.g. EGCC_TWR).
-    Does not require airport_live_status_latest; reads vatsim_*_latest tables only.
-    """
-    prefix = f"{icao}_%"
+def _build_vatsim_airport_entries(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    airports: dict[str, dict[str, Any]] = {}
+
     controller_rows = conn.execute(
         """
         SELECT callsign, name, facility, frequency, rating, server, logon_time, last_updated
         FROM vatsim_controllers_latest
-        WHERE facility IS NOT NULL AND facility > 0 AND callsign LIKE ?
-        ORDER BY facility ASC, callsign ASC
-        """,
-        (prefix,),
+        WHERE facility IN (2, 3, 4, 5, 6)
+        ORDER BY callsign ASC
+        """
     ).fetchall()
-    controllers: list[dict[str, Any]] = []
     for row in controller_rows:
+        airport = extract_airport_from_callsign(row["callsign"])
+        if not airport:
+            continue
+        entry = airports.setdefault(
+            airport,
+            {
+                "icao": airport,
+                "controllers": [],
+                "atis": [],
+                "name": None,
+                "country": None,
+                "region": None,
+                "latitude_deg": None,
+                "longitude_deg": None,
+            },
+        )
         fac = row["facility"]
-        controllers.append(
+        entry["controllers"].append(
             {
                 "callsign": row["callsign"],
                 "name": row["name"],
@@ -773,30 +909,349 @@ def build_vatsim_airport_payload(conn: sqlite3.Connection, icao: str) -> dict[st
         """
         SELECT callsign, airport, atis_code, frequency, text, last_updated
         FROM vatsim_atis_latest
-        WHERE UPPER(TRIM(airport)) = ?
-        ORDER BY last_updated DESC
-        """,
-        (icao,),
+        WHERE airport IS NOT NULL AND TRIM(airport) != ''
+        ORDER BY airport ASC, last_updated DESC
+        """
     ).fetchall()
-    atis_list = [
+    for row in atis_rows:
+        airport = str(row["airport"] or "").strip().upper()
+        if len(airport) < 3 or len(airport) > 4 or not airport.isalnum():
+            continue
+        entry = airports.setdefault(
+            airport,
+            {
+                "icao": airport,
+                "controllers": [],
+                "atis": [],
+                "name": None,
+                "country": None,
+                "region": None,
+                "latitude_deg": None,
+                "longitude_deg": None,
+            },
+        )
+        entry["atis"].append(
+            {
+                "callsign": row["callsign"],
+                "atis_code": row["atis_code"],
+                "frequency": row["frequency"],
+                "text": row["text"],
+                "last_updated": row["last_updated"],
+            }
+        )
+
+    if airports:
+        placeholders = ",".join("?" for _ in airports)
+        ref_rows = conn.execute(
+            f"""
+            SELECT icao, name, country, region, latitude_deg, longitude_deg
+            FROM airport_reference_latest
+            WHERE icao IN ({placeholders})
+            """,
+            tuple(sorted(airports.keys())),
+        ).fetchall()
+        for row in ref_rows:
+            airport = row["icao"]
+            entry = airports.get(airport)
+            if not entry:
+                continue
+            entry["name"] = row["name"]
+            entry["country"] = row["country"]
+            entry["region"] = row["region"]
+            entry["latitude_deg"] = row["latitude_deg"]
+            entry["longitude_deg"] = row["longitude_deg"]
+
+    for entry in airports.values():
+        coverage = _coverage_flags_from_controllers_and_atis(entry["controllers"], entry["atis"])
+        entry["controller_count"] = len(entry["controllers"])
+        entry["coverage"] = coverage
+        entry["coverage_score"] = _coverage_score(
+            coverage,
+            controller_count=entry["controller_count"],
+            atis_count=len(entry["atis"]),
+        )
+        entry["has_atis"] = coverage["hasAtis"]
+
+    return airports
+
+
+def build_ivao_airport_payload(conn: sqlite3.Connection, icao: str) -> dict[str, Any]:
+    """
+    IVAO online ATC positions for an airport prefix (e.g. EGLL_TWR matches EGLL).
+    Reads the ivao_atc_latest snapshot table only. Returns an empty controller
+    list (not an error) when nobody is online for the ICAO.
+    """
+    rows = conn.execute(
+        """
+        SELECT callsign, user_id, rating, frequency, position,
+               atis_revision, logon_time, last_updated
+        FROM ivao_atc_latest
+        WHERE callsign = ? OR callsign LIKE ? ESCAPE '\\'
+        ORDER BY callsign
+        """,
+        (icao, f"{icao}\\_%"),
+    ).fetchall()
+
+    controllers = [
         {
             "callsign": row["callsign"],
-            "atis_code": row["atis_code"],
+            "user_id": row["user_id"],
+            "rating": row["rating"],
             "frequency": row["frequency"],
-            "text": row["text"],
-            "last_updated": row["last_updated"],
+            "position": row["position"],
+            "atis_revision": row["atis_revision"],
+            "logon_time": row["logon_time"],
         }
-        for row in atis_rows
+        for row in rows
     ]
 
     return {
         "icao": icao,
-        "source": "vatsim",
+        "source": "ivao",
         "controller_count": len(controllers),
         "controllers": controllers,
-        "atis": atis_list,
-        "has_atis": len(atis_list) > 0,
         "fetched_at": utc_now_iso(),
+    }
+
+
+def build_vatsim_airport_payload(conn: sqlite3.Connection, icao: str) -> dict[str, Any]:
+    """
+    VATSIM online controllers and ATIS for an airport prefix (e.g. EGCC_TWR).
+    Does not require airport_live_status_latest; reads vatsim_*_latest tables only.
+    """
+    entry = _build_vatsim_airport_entries(conn).get(
+        icao,
+        {
+            "icao": icao,
+            "controllers": [],
+            "atis": [],
+            "coverage": _empty_coverage_flags(),
+            "controller_count": 0,
+            "has_atis": False,
+            "coverage_score": 0,
+            "name": None,
+            "country": None,
+            "region": None,
+            "latitude_deg": None,
+            "longitude_deg": None,
+        },
+    )
+
+    return {
+        "icao": icao,
+        "source": "vatsim",
+        "controller_count": entry["controller_count"],
+        "controllers": entry["controllers"],
+        "atis": entry["atis"],
+        "has_atis": entry["has_atis"],
+        "coverage": entry["coverage"],
+        "coverage_score": entry["coverage_score"],
+        "name": entry["name"],
+        "country": entry["country"],
+        "region": entry["region"],
+        "latitude_deg": entry["latitude_deg"],
+        "longitude_deg": entry["longitude_deg"],
+        "fetched_at": utc_now_iso(),
+    }
+
+
+def build_vatsim_airports_payload(
+    conn: sqlite3.Connection,
+    *,
+    limit: int,
+    include_empty: bool = False,
+    coverage_filters: dict[str, bool] | None = None,
+    sort: str = "coverage",
+) -> dict[str, Any]:
+    coverage_filters = coverage_filters or {}
+    airports = list(_build_vatsim_airport_entries(conn).values())
+
+    def include_entry(entry: dict[str, Any]) -> bool:
+        coverage = entry["coverage"]
+        if not include_empty and not coverage["hasAnyAtc"] and not coverage["hasAtis"]:
+            return False
+        return all(coverage.get(flag_name) is expected for flag_name, expected in coverage_filters.items())
+
+    filtered = [entry for entry in airports if include_entry(entry)]
+
+    def coverage_sort_key(entry: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            -int(entry["coverage_score"]),
+            -int(entry["controller_count"]),
+            -len(entry["atis"]),
+            entry["icao"],
+        )
+
+    def alpha_sort_key(entry: dict[str, Any]) -> tuple[Any, ...]:
+        return (entry["icao"],)
+
+    filtered.sort(key=coverage_sort_key if sort == "coverage" else alpha_sort_key)
+    top = filtered[:limit]
+    return {
+        "generated_at": utc_now_iso(),
+        "source": "vatsim",
+        "sort": sort,
+        "limit": limit,
+        "include_empty": include_empty,
+        "filters": coverage_filters,
+        "count": len(top),
+        "airports": [
+            {
+                "icao": entry["icao"],
+                "name": entry["name"],
+                "country": entry["country"],
+                "region": entry["region"],
+                "latitude_deg": entry["latitude_deg"],
+                "longitude_deg": entry["longitude_deg"],
+                "controller_count": entry["controller_count"],
+                "controllers": entry["controllers"],
+                "atis": entry["atis"],
+                "coverage": entry["coverage"],
+                "coverage_score": entry["coverage_score"],
+            }
+            for entry in top
+        ],
+    }
+
+
+def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius_nm = 3440.065
+    lat1_r = math.radians(lat1)
+    lon1_r = math.radians(lon1)
+    lat2_r = math.radians(lat2)
+    lon2_r = math.radians(lon2)
+    dlat = lat2_r - lat1_r
+    dlon = lon2_r - lon1_r
+    a = (
+        math.sin(dlat / 2.0) ** 2
+        + math.cos(lat1_r) * math.cos(lat2_r) * math.sin(dlon / 2.0) ** 2
+    )
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    return radius_nm * c
+
+
+def _airport_matches_route_region(entry: dict[str, Any], region_key: str) -> bool:
+    country = str(entry.get("country") or "").upper()
+    continent = str(entry.get("continent") or "").upper()
+    latitude = entry.get("latitude_deg")
+    if region_key == "uk":
+        return country == "GB"
+    if region_key == "europe":
+        return continent == "EU"
+    if region_key == "us":
+        return country == "US"
+    if region_key == "south_usa":
+        return country == "US" and latitude is not None and float(latitude) <= 37.0
+    return True
+
+
+def build_vatsim_routes_payload(
+    conn: sqlite3.Connection,
+    *,
+    region_key: str,
+    minutes: int,
+    limit: int,
+) -> dict[str, Any]:
+    airports = _build_vatsim_airport_entries(conn)
+    ref_rows = conn.execute(
+        """
+        SELECT icao, country, continent, latitude_deg, longitude_deg
+        FROM airport_reference_latest
+        """
+    ).fetchall()
+    for row in ref_rows:
+        entry = airports.get(row["icao"])
+        if not entry:
+            continue
+        entry["continent"] = row["continent"]
+        if entry.get("country") is None:
+            entry["country"] = row["country"]
+        if entry.get("latitude_deg") is None:
+            entry["latitude_deg"] = row["latitude_deg"]
+        if entry.get("longitude_deg") is None:
+            entry["longitude_deg"] = row["longitude_deg"]
+
+    target_minutes = minutes
+    cruise_speed_kt = 420.0
+    block_buffer_minutes = 20.0
+
+    region_candidates = [
+        entry
+        for entry in airports.values()
+        if entry["coverage"]["hasAnyAtc"]
+        and entry.get("latitude_deg") is not None
+        and entry.get("longitude_deg") is not None
+        and _airport_matches_route_region(entry, region_key)
+    ]
+    region_candidates.sort(key=lambda entry: (-int(entry["coverage_score"]), entry["icao"]))
+    pool = region_candidates[: min(len(region_candidates), 50)]
+
+    route_rows: list[dict[str, Any]] = []
+    for idx, departure in enumerate(pool):
+        dep_lat = float(departure["latitude_deg"])
+        dep_lon = float(departure["longitude_deg"])
+        for arrival in pool[idx + 1 :]:
+            arr_lat = float(arrival["latitude_deg"])
+            arr_lon = float(arrival["longitude_deg"])
+            distance_nm = _haversine_nm(dep_lat, dep_lon, arr_lat, arr_lon)
+            estimated_minutes = int(round((distance_nm / cruise_speed_kt) * 60.0 + block_buffer_minutes))
+            if estimated_minutes < 25:
+                continue
+            delta = abs(estimated_minutes - target_minutes)
+            route_score = (
+                5000
+                - delta * 8
+                + int(departure["coverage_score"])
+                + int(arrival["coverage_score"])
+                + departure["controller_count"] * 6
+                + arrival["controller_count"] * 6
+            )
+            route_rows.append(
+                {
+                    "departure": {
+                        "icao": departure["icao"],
+                        "name": departure["name"],
+                        "country": departure["country"],
+                        "controller_count": departure["controller_count"],
+                        "coverage": departure["coverage"],
+                    },
+                    "arrival": {
+                        "icao": arrival["icao"],
+                        "name": arrival["name"],
+                        "country": arrival["country"],
+                        "controller_count": arrival["controller_count"],
+                        "coverage": arrival["coverage"],
+                    },
+                    "distance_nm": round(distance_nm, 1),
+                    "estimated_minutes": estimated_minutes,
+                    "time_delta_minutes": delta,
+                    "route_score": route_score,
+                }
+            )
+
+    route_rows.sort(
+        key=lambda row: (
+            -int(row["route_score"]),
+            int(row["time_delta_minutes"]),
+            row["departure"]["icao"],
+            row["arrival"]["icao"],
+        )
+    )
+    top = route_rows[:limit]
+    return {
+        "generated_at": utc_now_iso(),
+        "region": region_key,
+        "region_label": _ROUTE_REGION_LABELS.get(region_key, region_key.upper()),
+        "target_minutes": target_minutes,
+        "limit": limit,
+        "count": len(top),
+        "assumptions": {
+            "requires_live_atc_at_both_airports": True,
+            "fallback_to_atis_when_atc_sparse": False,
+            "estimated_cruise_speed_kt": cruise_speed_kt,
+            "block_buffer_minutes": block_buffer_minutes,
+        },
+        "routes": top,
     }
 
 
@@ -1638,12 +2093,15 @@ def build_airports_ranked_payload(
     hours: int,
     limit: int,
     include_unmanned: bool = True,
+    coverage_filters: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """
     Ordered list: manned (live ATC) vs not, then how “busy” (controllers, filed inbounds, upcoming
     bookings/events, weather challenge score). Heuristic `rank_score` for dashboards.
     """
+    coverage_filters = coverage_filters or {}
     upcoming, now_m, win_end = _airport_upcoming_scores(conn, hours)
+    vatsim_airports = _build_vatsim_airport_entries(conn)
 
     live_by_ap: dict[str, sqlite3.Row] = {}
     try:
@@ -1723,6 +2181,11 @@ def build_airports_ranked_payload(
                 "manned": manned,
                 "controller_count": cc,
                 "has_atis": bool(lr["has_atis"]) if lr is not None else False,
+                "coverage": (
+                    vatsim_airports.get(ap, {}).get("coverage")
+                    or _finalize_coverage_flags({"hasAtis": bool(lr["has_atis"]) if lr is not None else False})
+                ),
+                "coverage_score": int(vatsim_airports.get(ap, {}).get("coverage_score") or 0),
                 "inbounds": ib,
                 "departures": dp,
                 "upcoming_bookings": b,
@@ -1735,6 +2198,13 @@ def build_airports_ranked_payload(
             }
         )
 
+    if coverage_filters:
+        rows_out = [
+            row
+            for row in rows_out
+            if all(row["coverage"].get(flag_name) is expected for flag_name, expected in coverage_filters.items())
+        ]
+
     rows_out.sort(key=lambda x: (-x["rank_score"], x["airport"]))
     top = rows_out[:limit]
 
@@ -1744,6 +2214,7 @@ def build_airports_ranked_payload(
         "window_start_utc": now_m,
         "window_end_utc": win_end,
         "include_unmanned": include_unmanned,
+        "filters": coverage_filters,
         "note": (
             "rank_score = 100k if manned + 500*controllers + 50*inbounds + 40*departures + "
             "10*upcoming_score + weather overall_score; upcoming uses bookings+events in window; "
@@ -1851,69 +2322,85 @@ def build_airport_runways_payload(
 
 
 _SAT_CACHE_DIR = Path(os.environ.get("SAT_CACHE_DIR", "")).expanduser() if os.environ.get("SAT_CACHE_DIR") else (
-    Path(__file__).parent.parent.parent / "data" / "sat_cache"
+    Path(__file__).parent.parent / "data" / "sat_cache"
 )
 
+# Preference order: jpg/jpeg first (high-res), png last (Bing fallback)
+_SAT_EXTENSIONS = (".jpg", ".jpeg", ".png")
+_SAT_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
 
-def _sat_cache_path(icao: str) -> Path:
-    return _SAT_CACHE_DIR / f"{icao.upper()}.png"
 
-
-def fetch_satellite_image(conn: sqlite3.Connection, icao: str) -> bytes | None:
+def fetch_satellite_image(conn: sqlite3.Connection, icao: str) -> tuple[bytes, str] | None:
     """
-    Return PNG bytes for an aerial satellite image of the given airport.
-    Checks the local cache first; if absent, fetches from Bing Maps Aerial API
-    and saves to cache so subsequent calls are free.
-    Returns None if the airport has no coordinates or Bing key is not configured.
+    Return (image_bytes, mime_type) for an aerial image of the given airport.
+
+    Lookup order:
+      1. sat_cache/{ICAO}.jpg|.jpeg|.png           — flat stock (existing images)
+      2. sat_cache/{COUNTRY}/{ICAO}.jpg             — beatmylanding writes here via AIRPORT_IMAGE_ROOT
+      3. ESRI World Imagery (free)                  — on-demand fetch, saved flat to sat_cache
     """
     icao = icao.upper().strip()
-    cache_path = _sat_cache_path(icao)
 
-    if cache_path.is_file():
-        LOGGER.debug("sat cache hit: %s", icao)
-        return cache_path.read_bytes()
+    # 1. Flat cache (existing stock + Bing-fetched images)
+    base = _SAT_CACHE_DIR / icao
+    for ext in _SAT_EXTENSIONS:
+        p = base.with_suffix(ext)
+        if p.is_file():
+            LOGGER.debug("sat flat hit: %s", p.name)
+            return p.read_bytes(), _SAT_MIME[ext]
 
-    # Need coordinates — look up from airport reference
+    # 2. Country subdirectory — beatmylanding writes {COUNTRY}/{ICAO}.jpg
     row = conn.execute(
-        "SELECT latitude_deg, longitude_deg FROM airport_reference_latest WHERE icao = ?",
+        "SELECT latitude_deg, longitude_deg, country FROM airport_reference_latest WHERE icao = ?",
         (icao,),
     ).fetchone()
+
+    if row is not None and row["country"]:
+        country_path = _SAT_CACHE_DIR / row["country"].upper() / f"{icao}.jpg"
+        if country_path.is_file():
+            LOGGER.debug("sat country-dir hit: %s", country_path)
+            return country_path.read_bytes(), "image/jpeg"
+
+    # 3. ESRI World Imagery fetch (free, no key)
     if row is None or row["latitude_deg"] is None or row["longitude_deg"] is None:
         LOGGER.warning("sat: no coordinates for %s", icao)
         return None
 
-    bing_key = os.environ.get("BING_MAPS_KEY", "").strip()
-    if not bing_key:
-        LOGGER.warning("sat: BING_MAPS_KEY not set, cannot fetch image for %s", icao)
-        return None
-
     lat = row["latitude_deg"]
     lon = row["longitude_deg"]
+    zoom = 14
+    width, height = 800, 500
+    meters_per_pixel = 156543.03392804 / (2 ** zoom)
+    half_w = (width / 2) * meters_per_pixel
+    half_h = (height / 2) * meters_per_pixel
+    cx = lon * 20037508.3427892 / 180
+    cy = math.log(math.tan((90 + lat) * math.pi / 360)) * 20037508.3427892 / math.pi
+    bbox = f"{cx - half_w:.2f},{cy - half_h:.2f},{cx + half_w:.2f},{cy + half_h:.2f}"
     url = (
-        f"https://dev.virtualearth.net/REST/v1/Imagery/Map/Aerial/{lat},{lon}/14"
-        f"?mapSize=800,500&key={bing_key}"
+        "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export?"
+        + urlencode({"bbox": bbox, "bboxSR": "102100", "size": f"{width},{height}",
+                     "imageSR": "102100", "format": "jpg", "transparent": "false", "f": "image"})
     )
-
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "AviationHub/1.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             if resp.status != 200:
-                LOGGER.warning("sat: Bing returned %s for %s", resp.status, icao)
+                LOGGER.warning("sat: ESRI returned %s for %s", resp.status, icao)
                 return None
             image_bytes = resp.read()
     except Exception as exc:
-        LOGGER.warning("sat: Bing fetch failed for %s: %s", icao, exc)
+        LOGGER.warning("sat: ESRI fetch failed for %s: %s", icao, exc)
         return None
 
-    # Write to cache
+    cache_path = _SAT_CACHE_DIR / f"{icao}.jpg"
     try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        _SAT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         cache_path.write_bytes(image_bytes)
-        LOGGER.info("sat: cached %s (%d bytes) → %s", icao, len(image_bytes), cache_path)
+        LOGGER.info("sat: ESRI cached %s (%d bytes)", icao, len(image_bytes))
     except OSError as exc:
         LOGGER.warning("sat: could not write cache for %s: %s", icao, exc)
 
-    return image_bytes
+    return image_bytes, "image/jpeg"
 
 
 class WidgetHandler(BaseHTTPRequestHandler):
@@ -1952,11 +2439,20 @@ class WidgetHandler(BaseHTTPRequestHandler):
             if parsed.path == VATSIM_AIRPORT_PATH:
                 self._handle_vatsim_airport(parsed.query)
                 return
+            if parsed.path == IVAO_AIRPORT_PATH:
+                self._handle_ivao_airport(parsed.query)
+                return
             if parsed.path == AIRPORTS_UPCOMING_PATH:
                 self._handle_airports_upcoming(parsed.query)
                 return
             if parsed.path == AIRPORTS_RANKED_PATH:
                 self._handle_airports_ranked(parsed.query)
+                return
+            if parsed.path == VATSIM_AIRPORTS_PATH:
+                self._handle_vatsim_airports(parsed.query)
+                return
+            if parsed.path == VATSIM_ROUTES_PATH:
+                self._handle_vatsim_routes(parsed.query)
                 return
             if parsed.path == VATSIM_EVENTS_PATH:
                 self._handle_vatsim_events(parsed.query)
@@ -2107,6 +2603,7 @@ class WidgetHandler(BaseHTTPRequestHandler):
         hours = _parse_hours_from_query(query, default=6, max_hours=168)
         limit = _parse_limit_from_query(query, default=50, max_limit=200)
         include_unmanned = _parse_bool_query(query, "include_unmanned", default=True)
+        coverage_filters = _parse_coverage_filters_from_query(query)
         try:
             with _open_readonly_connection(self.db_path) as conn:
                 payload = build_airports_ranked_payload(
@@ -2114,6 +2611,7 @@ class WidgetHandler(BaseHTTPRequestHandler):
                     hours=hours,
                     limit=limit,
                     include_unmanned=include_unmanned,
+                    coverage_filters=coverage_filters,
                 )
             self._send_json(HTTPStatus.OK, payload)
         except sqlite3.OperationalError as exc:
@@ -2130,6 +2628,56 @@ class WidgetHandler(BaseHTTPRequestHandler):
             return
         with _open_readonly_connection(self.db_path) as conn:
             payload = build_vatsim_airport_payload(conn, icao)
+        self._send_json(HTTPStatus.OK, payload)
+
+    def _handle_ivao_airport(self, query: str) -> None:
+        icao, error = _parse_vatsim_airport_icao_query(query)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                payload = build_ivao_airport_payload(conn, icao)
+            self._send_json(HTTPStatus.OK, payload)
+        except sqlite3.OperationalError as exc:
+            # ivao_atc_latest may not exist yet if the ingestor hasn't run since
+            # this feature was deployed.
+            LOGGER.warning("ivao airport API: %s", exc)
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "ivao_table_unavailable", "detail": str(exc)},
+            )
+
+    def _handle_vatsim_airports(self, query: str) -> None:
+        limit = _parse_limit_from_query(query, default=50, max_limit=200)
+        include_empty = _parse_bool_query(query, "include_empty", default=False)
+        sort = _parse_sort_query(query, "sort", default="coverage", allowed={"coverage", "icao"})
+        coverage_filters = _parse_coverage_filters_from_query(query)
+        with _open_readonly_connection(self.db_path) as conn:
+            payload = build_vatsim_airports_payload(
+                conn,
+                limit=limit,
+                include_empty=include_empty,
+                coverage_filters=coverage_filters,
+                sort=sort,
+            )
+        self._send_json(HTTPStatus.OK, payload)
+
+    def _handle_vatsim_routes(self, query: str) -> None:
+        params = parse_qs(query)
+        region = (params.get("region", [""])[0] or "uk").strip().lower()
+        if region not in _ROUTE_REGION_LABELS:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_region"})
+            return
+        minutes = _parse_minutes_from_query(query, default=90, min_minutes=30, max_minutes=360)
+        limit = _parse_limit_from_query(query, default=10, max_limit=25)
+        with _open_readonly_connection(self.db_path) as conn:
+            payload = build_vatsim_routes_payload(
+                conn,
+                region_key=region,
+                minutes=minutes,
+                limit=limit,
+            )
         self._send_json(HTTPStatus.OK, payload)
 
     def _handle_vatsim_events(self, query: str) -> None:
@@ -2223,16 +2771,17 @@ class WidgetHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
             return
         with _open_readonly_connection(self.db_path) as conn:
-            image_bytes = fetch_satellite_image(conn, icao)
-        if image_bytes is None:
+            result = fetch_satellite_image(conn, icao)
+        if result is None:
             self._send_json(
                 HTTPStatus.NOT_FOUND,
                 {"error": "satellite_unavailable", "icao": icao,
-                 "detail": "No coordinates in DB or BING_MAPS_KEY not set"},
+                 "detail": "No coordinates in DB or ESRI fetch failed"},
             )
             return
+        image_bytes, mime_type = result
         self.send_response(HTTPStatus.OK.value)
-        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Type", mime_type)
         self.send_header("Content-Length", str(len(image_bytes)))
         self.send_header("Cache-Control", "public, max-age=86400")
         self.end_headers()

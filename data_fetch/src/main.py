@@ -26,6 +26,7 @@ from fetchers.ingest_vatsim_atc_bookings import (
 )
 from fetchers.ingest_vatsim_events import FEED_NAME as VATSIM_EVENTS_FEED, process_vatsim_events
 from fetchers.vatsim import FEED_NAME as VATSIM_FEED, next_poll_seconds, process_vatsim_network
+from fetchers.ivao import FEED_NAME as IVAO_FEED, process_ivao_network
 from util import configure_logging, utc_now_iso
 from widget_server import start_widget_server
 
@@ -165,6 +166,19 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
                 last_error=str(exc),
                 last_error_at=utc_now_iso(),
             )
+
+        try:
+            LOGGER.info("Checking %s", IVAO_FEED)
+            process_ivao_network(conn, session)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("IVAO processing failed: %s", exc)
+            update_feed_state(
+                conn,
+                feed_name=IVAO_FEED,
+                last_fetch=utc_now_iso(),
+                last_error=str(exc),
+                last_error_at=utc_now_iso(),
+            )
         return 0
 
     now = time.time()
@@ -183,6 +197,10 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
             next_run=0.0,
         ),
         OURAIRPORTS_FEED: PollState(interval=3600, next_run=0.0),
+        IVAO_FEED: PollState(
+            interval=_env_poll_seconds("IVAO_POLL_SECONDS", 60),
+            next_run=0.0,
+        ),
     }
 
     while not STOP_EVENT.is_set():
@@ -348,6 +366,26 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
                     last_error_at=utc_now_iso(),
                 )
             polls[OURAIRPORTS_FEED].next_run = now + polls[OURAIRPORTS_FEED].interval
+
+        if now >= polls[IVAO_FEED].next_run:
+            try:
+                LOGGER.info("Checking %s", IVAO_FEED)
+                process_ivao_network(conn, session)
+                LOGGER.info(
+                    "%s check complete; next check in %ss",
+                    IVAO_FEED,
+                    polls[IVAO_FEED].interval,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("IVAO processing failed: %s", exc)
+                update_feed_state(
+                    conn,
+                    feed_name=IVAO_FEED,
+                    last_fetch=utc_now_iso(),
+                    last_error=str(exc),
+                    last_error_at=utc_now_iso(),
+                )
+            polls[IVAO_FEED].next_run = now + polls[IVAO_FEED].interval
 
         sleep_for = max(1.0, min(state.next_run for state in polls.values()) - time.time())
         STOP_EVENT.wait(timeout=sleep_for)

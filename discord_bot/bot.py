@@ -29,6 +29,7 @@ import logging
 import math
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
@@ -899,6 +900,45 @@ async def cmd_metar(interaction: discord.Interaction, icao: str) -> None:
     await interaction.followup.send(embed=embed)
 
 
+@bot.tree.command(name="ivao", description="IVAO online ATC for an airport (Aviation Hub snapshot)")
+@app_commands.describe(icao="4-letter ICAO")
+async def cmd_ivao(interaction: discord.Interaction, icao: str) -> None:
+    session = bot.http_session
+    assert session is not None
+    code = icao.strip().upper()
+    if len(code) != 4 or not code.isalnum():
+        await interaction.response.send_message("ICAO must be 4 alphanumeric characters.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)
+    status, data = await _hub_get(session, "/api/ivao/airport", icao=code)
+    if status != 200:
+        await interaction.followup.send(
+            f"Hub returned **{status}** for `{code}`: `{data.get('error', data)}`",
+            ephemeral=True,
+        )
+        return
+
+    controllers = data.get("controllers") or []
+    lines: list[str] = []
+    for c in controllers:
+        freq = c.get("frequency")
+        pos = c.get("position") or ""
+        since = _format_online_since(c.get("logon_time"))
+        freq_part = f" · {freq} MHz" if freq else ""
+        pos_part = f" {pos}" if pos else ""
+        lines.append(f"• `{c.get('callsign')}`{pos_part}{freq_part} · online {since}")
+    if not lines:
+        lines.append("No IVAO ATC positions online right now.")
+
+    embed = discord.Embed(
+        title=f"IVAO ATC — {code} (online now: {len(controllers)})",
+        description=_truncate("\n".join(lines), 3900),
+        color=discord.Color.dark_gold(),
+    )
+    embed.set_footer(text="Live IVAO whazzup snapshot · served from Aviation Hub")
+    await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="spicy", description="Current spicy airports widget (Aviation Hub)")
 @app_commands.describe(region="Optional region filter")
 @app_commands.choices(
@@ -1522,7 +1562,7 @@ async def cmd_runway(interaction: discord.Interaction, icao: str) -> None:
     await interaction.followup.send(embed=embed)
 
 
-@bot.tree.command(name="sat", description="Satellite aerial image of an airport (Bing Maps, cached locally)")
+@bot.tree.command(name="sat", description="Satellite aerial image of an airport (ESRI World Imagery, cached locally)")
 @app_commands.describe(icao="4-letter ICAO code")
 async def cmd_sat(interaction: discord.Interaction, icao: str) -> None:
     session = bot.http_session
@@ -1539,14 +1579,13 @@ async def cmd_sat(interaction: discord.Interaction, icao: str) -> None:
     if st_status == 200:
         airport_name = st_data.get("name") or ""
 
-    # Request the PNG from the hub — it handles cache check and Bing fetch
+    # Request the image from the hub — it handles cache lookup and ESRI fetch
     url = _hub_url("/api/satellite", {"icao": code})
     try:
         async with session.get(url) as resp:
             if resp.status == 404:
                 await interaction.followup.send(
-                    f"No satellite image available for **`{code}`** — airport may not be in the reference DB, "
-                    "or `BING_MAPS_KEY` is not set on the hub.",
+                    f"No satellite image available for **`{code}`** — airport may not be in the reference DB.",
                     ephemeral=True,
                 )
                 return
@@ -1555,23 +1594,27 @@ async def cmd_sat(interaction: discord.Interaction, icao: str) -> None:
                     f"Hub returned **{resp.status}** for satellite image of `{code}`.", ephemeral=True
                 )
                 return
+            content_type = resp.headers.get("Content-Type", "image/jpeg")
             image_bytes = await resp.read()
     except aiohttp.ClientError as exc:
         LOG.warning("sat fetch failed for %s: %s", code, exc)
         await interaction.followup.send("Could not reach the Aviation Hub API.", ephemeral=True)
         return
 
+    # Pick filename extension to match actual content type
+    filename = "satellite.jpg" if "jpeg" in content_type or "jpg" in content_type else "satellite.png"
+
     title = f"Satellite — {code}"
     if airport_name:
         title += f"  ·  {airport_name}"
 
     embed = discord.Embed(title=title, color=discord.Color.dark_blue())
-    embed.set_image(url="attachment://satellite.png")
-    embed.set_footer(text="Bing Maps Aerial · served from Aviation Hub cache")
+    embed.set_image(url=f"attachment://{filename}")
+    embed.set_footer(text="Aerial imagery · served from Aviation Hub cache")
 
     await interaction.followup.send(
         embed=embed,
-        file=discord.File(io.BytesIO(image_bytes), filename="satellite.png"),
+        file=discord.File(io.BytesIO(image_bytes), filename=filename),
     )
 
 
@@ -1586,6 +1629,7 @@ async def cmd_help(interaction: discord.Interaction) -> None:
     weather_names = ("atis", "metar", "sigmet", "taf", "weather")
     airport_names = ("airport", "runway", "sat", "spicy", "summary")
     vatsim_names = ("bookings", "events", "inbounds", "ranked", "upcoming", "vatsim")
+    simbrief_names = ("airlines", "myplan", "postflight")
     meta_names = ("help", "info", "ping")
 
     def pick(names: tuple[str, ...]) -> list[app_commands.AppCommand]:
@@ -1594,8 +1638,9 @@ async def cmd_help(interaction: discord.Interaction) -> None:
     weather_cmds = pick(weather_names)
     airport_cmds = pick(airport_names)
     vatsim_cmds = pick(vatsim_names)
+    simbrief_cmds = pick(simbrief_names)
     meta_cmds = pick(meta_names)
-    known = set(weather_names) | set(airport_names) | set(vatsim_names) | set(meta_names)
+    known = set(weather_names) | set(airport_names) | set(vatsim_names) | set(simbrief_names) | set(meta_names)
     other_cmds = [c for c in cmds if c.name not in known]
 
     embed = discord.Embed(
@@ -1617,6 +1662,11 @@ async def cmd_help(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="VATSIM & traffic",
         value=_truncate(_help_embed_field_lines(vatsim_cmds), 1024) or "—",
+        inline=False,
+    )
+    embed.add_field(
+        name="SimBrief & flight planning",
+        value=_truncate(_help_embed_field_lines(simbrief_cmds), 1024) or "—",
         inline=False,
     )
     embed.add_field(
@@ -1678,6 +1728,363 @@ async def cmd_ping(interaction: discord.Interaction) -> None:
     else:
         ws = f"**{round(lat * 1000)}** ms"
     await interaction.response.send_message(f"Pong — Discord gateway: {ws}")
+
+
+# ── SimBrief helpers ──────────────────────────────────────────────────────────
+
+_AIRLINES_PATH = Path(__file__).parent / "airlines.json"
+try:
+    with _AIRLINES_PATH.open(encoding="utf-8") as _f:
+        _AIRLINE_DATA: dict[str, Any] = json.load(_f)["airlines"]
+except Exception as _exc:
+    LOG.warning("Could not load airlines.json: %s", _exc)
+    _AIRLINE_DATA = {}
+
+
+def _get_airline_name(icao: str) -> str:
+    if not icao or len(icao) != 3:
+        return "Unknown"
+    return _AIRLINE_DATA.get(icao.upper(), {}).get("name", "Unknown")
+
+
+def _metar_pretty(metar: str, code: str) -> tuple[str, str]:
+    try:
+        parts = metar.split()
+        icao = parts[0] if parts else code
+        time_raw = parts[1] if len(parts) > 1 else "------Z"
+        wind = next((p for p in parts if "KT" in p), "00000KT")
+        visibility = next((p for p in parts if p.isdigit() or p == "9999"), "0000")
+        clouds = next(
+            (p for p in parts if any(c in p for c in ["FEW", "SCT", "BKN", "OVC", "NCD", "NSC"])),
+            None,
+        )
+        temp_dew = next((p for p in parts if "/" in p and p.count("/") == 1), "??/??")
+        qnh_val = next((p for p in parts if p.startswith("Q")), None)
+
+        hours = time_raw[2:4] if len(time_raw) >= 6 else "??"
+        minutes = time_raw[4:6] if len(time_raw) >= 6 else "??"
+        time_fmt = f"{hours}:{minutes}Z"
+        wind_dir = wind[:3] if len(wind) >= 5 else "000"
+        wind_speed = "".join(filter(str.isdigit, wind[3:]))[:2] if len(wind) >= 5 else "00"
+        temp, dew = temp_dew.split("/") if "/" in temp_dew else ("??", "??")
+        visibility_km = "10+km" if visibility == "9999" else f"{float(visibility) / 1000:.1f}km"
+        qnh_display = qnh_val[1:] if qnh_val else "----"
+
+        cloud_desc = ""
+        cloud_emoji = ""
+        if clouds:
+            cl = clouds.lower()
+            if "few" in cl:
+                cloud_emoji, cloud_desc = "🌤️", f"🌤️ Few clouds ({clouds})"
+            elif "sct" in cl:
+                cloud_emoji, cloud_desc = "⛅", f"⛅ Scattered clouds ({clouds})"
+            elif "bkn" in cl:
+                cloud_emoji, cloud_desc = "☁️", f"☁️ Broken clouds ({clouds})"
+            elif "ovc" in cl:
+                cloud_emoji, cloud_desc = "☁️", f"☁️ Overcast ({clouds})"
+            elif "ncd" in cl or "nsc" in cl:
+                cloud_emoji, cloud_desc = "☀️", "☀️ Clear sky"
+            else:
+                cloud_emoji, cloud_desc = "☁️", f"☁️ {clouds}"
+        else:
+            cloud_desc = "No clouds"
+
+        wx_labels: list[str] = []
+        ml = metar.lower()
+        if "cavok" in ml:
+            wx_labels.append("☀️ CAVOK")
+        if "ts" in ml:
+            wx_labels.append("⛈️ Thunderstorm")
+        if "ra" in ml:
+            wx_labels.append("🌧️ Rain")
+        if "sn" in ml:
+            wx_labels.append("🌨️ Snow")
+        if "fg" in ml or "br" in ml or "fog" in ml:
+            wx_labels.append("🌫️ Fog")
+
+        blocks = [
+            f"{icao} @ {time_fmt}",
+            f"💨 Wind {wind_dir}°/{wind_speed}kt",
+            f"👁️ Vis {visibility_km}",
+        ]
+        if wx_labels:
+            blocks.extend(wx_labels)
+        if cloud_desc:
+            blocks.append(cloud_desc)
+        blocks.append(f"🌡️ {temp}°C/{dew}°C")
+
+        prefix = wx_labels[0].split()[0] if wx_labels else (cloud_emoji or "🛰️")
+        return prefix + " " + " | ".join(blocks), qnh_display
+    except Exception:
+        return f"🛰️ {code} | {metar}", "----"
+
+
+def _simbrief_fmt_creation_time(creation_time: str) -> str:
+    try:
+        if "T" in creation_time and creation_time.endswith("Z"):
+            date_part, time_part = creation_time.replace("Z", "").split("T")
+        elif " " in creation_time:
+            date_part, time_part = creation_time.split(" ", 1)
+            time_part = time_part.split()[0]
+        else:
+            return creation_time
+        hm = ":".join(time_part.split(":")[:2])
+        return f"📅 {date_part}  🕒 {hm} UTC"
+    except Exception:
+        return creation_time
+
+
+def _simbrief_format_data(
+    discord_username: str, simbrief_username: str, flight_data: dict[str, Any]
+) -> tuple[str, str, str]:
+    g = flight_data.get("general", {})
+    p = flight_data.get("api_params", {})
+    t = flight_data.get("times", {})
+    f = flight_data.get("fuel", {})
+    aircraft_data = flight_data.get("aircraft", {})
+    origin = flight_data.get("origin", {})
+    destination = flight_data.get("destination", {})
+
+    creation_time_val = t.get("creation_time")
+    if creation_time_val and str(creation_time_val).isdigit() and int(creation_time_val) > 0:
+        creation_time = datetime.fromtimestamp(
+            int(creation_time_val), tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S Zulu")
+    else:
+        creation_time = flight_data.get("params", {}).get("time_generated") or "Unknown"
+
+    dep_code = origin.get("icao_code", p.get("orig", "???"))
+    dep_name = origin.get("name", dep_code)
+    dep_rwy = p.get("origrwy", "N/A")
+    dep_metar_line, dep_qnh = _metar_pretty(origin.get("metar", "No METAR available"), dep_code)
+
+    arr_code = destination.get("icao_code", p.get("dest", "???"))
+    arr_name = destination.get("name", arr_code)
+    arr_rwy = p.get("destrwy", "N/A")
+    arr_metar_line, arr_qnh = _metar_pretty(destination.get("metar", "No METAR available"), arr_code)
+
+    initial_alt = g.get("initial_altitude", "N/A")
+    if initial_alt and str(initial_alt).isdigit():
+        initial_alt = f"FL{initial_alt}"
+
+    icao_code = g.get("icao_airline", "")
+    flt_num = f"{icao_code}{g.get('flight_number', '')}" or "N/A"
+    airline_name = _get_airline_name(icao_code)
+    aircraft_type = (
+        aircraft_data.get("name") or g.get("icao_aircraft") or p.get("type") or "Unknown Aircraft"
+    )
+    registration = aircraft_data.get("reg", g.get("registration", "N/A"))
+
+    sid = g.get("sid_ident", "N/A")
+    star = g.get("star_ident", "N/A")
+    airac = flight_data.get("params", {}).get("airac", "N/A")
+    airac_ver = flight_data.get("params", {}).get("airac_ver", "")
+    release = g.get("release", "")
+    airac_version = airac_ver or (f"v{release}" if release else "v1")
+    airac_display = f"{airac}{airac_version}".strip()
+
+    total_burn = f.get("enroute_burn", "N/A")
+    air_dist = g.get("air_distance", "N/A")
+    route_dist = g.get("route_distance", "N/A")
+    cost_index = g.get("costindex", "N/A")
+    cruise_profile = g.get("cruise_profile", "N/A")
+    cruise_mach = g.get("cruise_mach", "N/A")
+    avg_wind_dir = g.get("avg_wind_dir", "N/A")
+    avg_wind_spd = g.get("avg_wind_spd", "N/A")
+    avg_wind_comp = g.get("avg_wind_comp", "N/A")
+    avg_temp_dev = g.get("avg_temp_dev", "N/A")
+
+    route_parts = g.get("route", p.get("route", "N/A")).split()
+    if sid != "N/A" and route_parts and route_parts[0].upper() == sid.upper():
+        route_parts = route_parts[1:]
+    if star != "N/A" and route_parts and route_parts[-1].upper() == star.upper():
+        route_parts = route_parts[:-1]
+    core_route = " ".join(route_parts)
+
+    creation_time_fmt = _simbrief_fmt_creation_time(creation_time)
+    message = (
+        "==============================\n"
+        f"📝 **Flight Plan Created:** {creation_time_fmt}\n"
+        f"👤 **Discord User:** {discord_username}\n"
+        f"🪪 **SimBrief Username:** {simbrief_username}\n"
+        "-----------------------------------------\n"
+        f"🆔 **Flight Number:** {flt_num}\n"
+        f"🛩️ **Airline:** {airline_name}\n"
+        f"🚗 **Aircraft Type:** {aircraft_type}\n"
+        f"📝 **Aircraft Registration:** {registration}\n"
+        "-----------------------------------------\n"
+        f"🎈 **Initial Altitude:** {initial_alt}\n"
+        f"🔼 **SID:** {sid} | **RWY:** {dep_rwy}\n"
+        f"🔽 **STAR:** {star} | **RWY:** {arr_rwy}\n"
+        f"🗺️ **Route:** {core_route}\n"
+        f"📅 **AIRAC:** {airac_display}\n"
+        "-----------------------------------------\n"
+        f"🛢️ **Burn:** {total_burn}kg | **Dist (air):** {air_dist}nm, **Route:** {route_dist}nm\n"
+        f"🚀 **Cost Index:** {cost_index} | **Cruise:** {cruise_profile} | **Mach:** {cruise_mach}\n"
+        f"🧭 **Avg Wind:** {avg_wind_dir}°/{avg_wind_spd}kt (Component: {avg_wind_comp}kt) | **Temp dev:** ISA+{avg_temp_dev}°C\n"
+        "-----------------------------------------\n"
+        f"🛬 **Departure:** {dep_code} ({dep_name})   **RWY:** {dep_rwy}   🧊 **QNH:** {dep_qnh} hPa\n"
+        f"{dep_metar_line}\n"
+        f"🛫 **Arrival:** {arr_code} ({arr_name})   **RWY:** {arr_rwy}   🧊 **QNH:** {arr_qnh} hPa\n"
+        f"{arr_metar_line}\n"
+        "=============================="
+    )
+    return message, dep_code, arr_code
+
+
+async def _validate_simbrief_username(session: aiohttp.ClientSession, username: str) -> bool:
+    try:
+        async with session.get(
+            f"https://www.simbrief.com/api/xml.fetcher.php?username={username}"
+        ) as resp:
+            text = await resp.text()
+            return "<status>Success</status>" in text
+    except Exception as exc:
+        LOG.warning("SimBrief validation failed for %r: %s", username, exc)
+        return False
+
+
+async def _fetch_and_format_simbrief_plan(
+    session: aiohttp.ClientSession,
+    simbrief_username: str,
+    display_name: str,
+) -> tuple[tuple[str, str, str] | None, str | None]:
+    try:
+        async with session.get(
+            f"https://www.simbrief.com/api/xml.fetcher.php?username={simbrief_username}&json=v2"
+        ) as resp:
+            if resp.status == 400:
+                return None, "❌ No active SimBrief flight plan found."
+            if resp.status != 200:
+                return None, f"❌ SimBrief returned status {resp.status}."
+            flight_data = await resp.json(content_type=None)
+    except Exception as exc:
+        LOG.warning("SimBrief fetch failed for %r: %s", simbrief_username, exc)
+        return None, "❌ Could not reach SimBrief API."
+
+    if "general" not in flight_data:
+        return None, "❌ SimBrief returned data I couldn't format safely."
+
+    try:
+        result = _simbrief_format_data(display_name, simbrief_username, flight_data)
+    except Exception as exc:
+        LOG.warning("SimBrief format failed: %s", exc)
+        return None, "❌ Failed to format SimBrief plan."
+
+    return result, None
+
+
+# ── SimBrief slash commands ────────────────────────────────────────────────────
+
+@bot.tree.command(
+    name="airlines",
+    description="Send the full airline ICAO code & callsign list to your DMs",
+)
+async def cmd_airlines(interaction: discord.Interaction) -> None:
+    if not _AIRLINE_DATA:
+        await interaction.response.send_message("❌ Airline data not loaded.", ephemeral=True)
+        return
+
+    fields = [
+        (icao, f"**{info.get('name', 'Unknown')}** (`{info.get('call_sign', 'N/A')}`)")
+        for icao, info in sorted(_AIRLINE_DATA.items(), key=lambda item: item[1].get("name", "").lower())
+    ]
+    chunks = [fields[i: i + 25] for i in range(0, len(fields), 25)]
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    dm_sent = False
+    for i, chunk in enumerate(chunks):
+        embed = discord.Embed(
+            title="✈️ Airline ICAO Codes & Callsigns",
+            description="Use these ICAO codes when setting up your SimBrief flight plan:",
+            color=discord.Color.teal(),
+        )
+        for name, value in chunk:
+            embed.add_field(name=name, value=value, inline=True)
+        embed.set_footer(text=f"Page {i + 1} of {len(chunks)}")
+        try:
+            await interaction.user.send(embed=embed)
+            dm_sent = True
+        except discord.Forbidden:
+            break
+
+    if dm_sent:
+        await interaction.followup.send(
+            "📡 Airline directory dispatched to your DMs. Check your inbox, captain! ✈️",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            "⚠️ Couldn't send you a DM — you may have DMs disabled from server members.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="myplan",
+    description="Fetch and DM the latest SimBrief flight plan for a username",
+)
+@app_commands.describe(simbrief_username="SimBrief username to fetch the plan for")
+async def cmd_myplan(interaction: discord.Interaction, simbrief_username: str) -> None:
+    session = bot.http_session
+    assert session is not None
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    if not await _validate_simbrief_username(session, simbrief_username):
+        await interaction.followup.send(
+            "❌ That SimBrief username doesn't appear to exist. Please double-check!",
+            ephemeral=True,
+        )
+        return
+
+    result, error = await _fetch_and_format_simbrief_plan(
+        session, simbrief_username, str(interaction.user)
+    )
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+
+    message, dep, arr = result  # type: ignore[misc]
+    try:
+        await interaction.user.send(f"```\n{message}\n```")
+        await interaction.followup.send(
+            f"📬 Sent `{simbrief_username}`'s latest plan to your DMs: `{dep}` → `{arr}`",
+            ephemeral=True,
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "❌ I couldn't DM you. Please enable DMs from server members.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="postflight",
+    description="Post the latest SimBrief flight plan for a username in this channel",
+)
+@app_commands.describe(simbrief_username="SimBrief username to fetch the plan for")
+async def cmd_postflight(interaction: discord.Interaction, simbrief_username: str) -> None:
+    session = bot.http_session
+    assert session is not None
+    await interaction.response.defer(thinking=True)
+
+    if not await _validate_simbrief_username(session, simbrief_username):
+        await interaction.followup.send(
+            "❌ That SimBrief username doesn't appear to exist. Please double-check!"
+        )
+        return
+
+    result, error = await _fetch_and_format_simbrief_plan(
+        session, simbrief_username, str(interaction.user)
+    )
+    if error:
+        await interaction.followup.send(error)
+        return
+
+    message, dep, arr = result  # type: ignore[misc]
+    await interaction.followup.send(
+        f"🛫 Flight plan for `{simbrief_username}` — `{dep}` → `{arr}`\n```\n{message}\n```"
+    )
 
 
 def main() -> int:

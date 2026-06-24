@@ -95,6 +95,26 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_vatsim_atis_last_updated
             ON vatsim_atis_latest (last_updated);
 
+        -- IVAO online ATC snapshot (mirrors the VATSIM controller table; fed by
+        -- fetchers/ivao.py from the IVAO whazzup v2 feed). Full-snapshot table:
+        -- each poll upserts current positions and deletes any no longer online.
+        CREATE TABLE IF NOT EXISTS ivao_atc_latest (
+            callsign TEXT PRIMARY KEY,
+            user_id INTEGER,
+            rating INTEGER,
+            frequency TEXT,
+            position TEXT,
+            latitude REAL,
+            longitude REAL,
+            atis_revision TEXT,
+            logon_time TEXT,
+            last_updated TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_ivao_atc_last_updated
+            ON ivao_atc_latest (last_updated);
+        CREATE INDEX IF NOT EXISTS idx_ivao_atc_position
+            ON ivao_atc_latest (position);
+
         CREATE TABLE IF NOT EXISTS metar_latest (
             icao TEXT PRIMARY KEY,
             observation_time TEXT,
