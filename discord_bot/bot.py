@@ -15,6 +15,10 @@ Environment:
   DISCORD_CLIENT_ID       — alias for DISCORD_APPLICATION_ID (either may be set)
   AVIATION_HUB_SUPPORT_SERVER_URL — support Discord invite (e.g. https://discord.gg/…)
 
+  Full GND + TWR airport alerts (optional, configured per Discord server):
+  DISCORD_FULL_GND_TWR_ALERT_POLL_SECONDS — poll interval; default 60
+  DISCORD_FULL_GND_TWR_ALERT_STATE_FILE  — optional config/state file path; default beside bot.py
+
 Utility slash commands (no hub call): /help lists every command’s description from this tree; /info
 shows Aviation Hub text and the invite links above; /ping shows Discord gateway latency.
 
@@ -28,6 +32,8 @@ import json
 import logging
 import math
 import os
+import re
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -36,9 +42,10 @@ from urllib.parse import urlencode
 import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 LOG = logging.getLogger("aviation_hub.discord")
+FULL_GND_TWR_ALERT_MIN_CONTROLLERS = 3
 
 
 def _normalize_snowflake_env(raw: str | None) -> str:
@@ -61,6 +68,18 @@ def _normalize_discord_bot_token(raw: str | None) -> str:
     if t.lower().startswith("bot "):
         t = t[4:].strip()
     return t
+
+
+def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        LOG.warning("Invalid integer env %s=%r; using %s", name, raw, default)
+        return default
+    return max(min_value, min(max_value, value))
 
 
 def _hub_base() -> str:
@@ -90,6 +109,25 @@ def _hub_add_invite_url() -> str | None:
 def _hub_support_server_url() -> str | None:
     u = os.environ.get("AVIATION_HUB_SUPPORT_SERVER_URL", "").strip()
     return u or None
+
+
+def _full_gnd_twr_alert_poll_seconds() -> int:
+    return _env_int("DISCORD_FULL_GND_TWR_ALERT_POLL_SECONDS", 60, 30, 3600)
+
+
+def _full_gnd_twr_alert_state_file() -> Path:
+    raw = os.environ.get("DISCORD_FULL_GND_TWR_ALERT_STATE_FILE", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path(__file__).resolve().parent / ".full_ground_tower_alerts.json"
+
+
+def _airport_controller_count(airport: dict[str, Any]) -> int:
+    try:
+        return int(airport.get("controller_count") or 0)
+    except (TypeError, ValueError):
+        controllers = airport.get("controllers") or []
+        return len(controllers) if isinstance(controllers, list) else 0
 
 
 def _hub_url(path: str, params: dict[str, Any]) -> str:
@@ -198,6 +236,150 @@ def _airport_in_region(icao: str, region_key: str | None) -> bool:
     return any(code.startswith(p) for p in prefixes)
 
 
+# ── Airport reference data (pre-loaded for distance / nearby / xwind) ────────
+
+_DB_PATH = Path(__file__).resolve().parent.parent / "data_fetch" / "data" / "aviation_hub.db"
+
+
+def _load_airport_ref() -> dict[str, dict]:
+    """Load all airports from the hub SQLite DB into memory, keyed by ICAO."""
+    result: dict[str, dict] = {}
+    try:
+        conn = sqlite3.connect(str(_DB_PATH))
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        c.execute(
+            "SELECT icao, name, latitude_deg, longitude_deg, type, country, municipality "
+            "FROM airport_reference_latest"
+        )
+        for row in c.fetchall():
+            result[row["icao"]] = dict(row)
+        conn.close()
+        LOG.info("Loaded %s airports from reference DB.", len(result))
+    except Exception as _exc:
+        LOG.warning("Could not load airport reference DB: %s", _exc)
+    return result
+
+
+_AIRPORT_REF: dict[str, dict] = _load_airport_ref()
+
+
+def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in nautical miles."""
+    R_NM = 3440.065
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return R_NM * 2 * math.asin(math.sqrt(a))
+
+
+def _initial_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Initial true bearing in degrees (0–360)."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlambda = math.radians(lon2 - lon1)
+    x = math.sin(dlambda) * math.cos(phi2)
+    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlambda)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
+def _decode_winds_field(raw: str, high_level: bool = False) -> tuple[int | None, int | None, int | None]:
+    """
+    Decode one FAA winds-aloft value field → (dir_deg, speed_kt, temp_c).
+    Low-level: "2134+21" (DDSS[+/-TT]) or just "1210"
+    High-level: "181331" (DDSSTT, temp always expressed as positive but means negative)
+    Returns (None, None, None) for missing/trace entries.
+    """
+    raw = raw.strip()
+    if not raw or set(raw) <= {" "}:
+        return None, None, None
+    # Light and variable
+    if raw.startswith("9900"):
+        temp_str = raw[4:]
+        temp: int | None = None
+        m_t = re.match(r'^([+\-]\d+)$', temp_str)
+        if m_t:
+            temp = int(m_t.group(1))
+        return 0, 0, temp
+    # Low-level: 4 base digits + optional sign+temp
+    m_lo = re.match(r'^(\d{4})([+\-]\d+)?$', raw)
+    if m_lo:
+        dd = int(raw[0:2])
+        ss = int(raw[2:4])
+        if dd >= 51:        # speed > 100 kt encoded
+            dd -= 50
+            ss += 100
+        dir_deg = (dd * 10) % 360
+        temp_c: int | None = int(m_lo.group(2)) if m_lo.group(2) else None
+        return dir_deg, ss, temp_c
+    # High-level: 6 digits DDSSTT (temp always negative above FL240)
+    m_hi = re.match(r'^(\d{6})$', raw)
+    if m_hi:
+        dd = int(raw[0:2])
+        ss = int(raw[2:4])
+        tt = int(raw[4:6])
+        if dd >= 51:
+            dd -= 50
+            ss += 100
+        dir_deg = (dd * 10) % 360
+        return dir_deg, ss, -tt
+    return None, None, None
+
+
+def _parse_winds_table(text: str, station_id: str) -> dict[int, tuple[int | None, int | None, int | None]]:
+    """
+    Parse the FAA FD winds-aloft text table and return data for station_id.
+    Returns dict keyed by altitude_ft → (dir_deg, speed_kt, temp_c).
+    """
+    sid = station_id.upper().strip()
+    lines = text.splitlines()
+    alt_levels: list[int] = []
+    header_idx = -1
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("FT ") or stripped.startswith("FT\t"):
+            header_idx = i
+            for p in stripped.split()[1:]:
+                try:
+                    alt_levels.append(int(p))
+                except ValueError:
+                    pass
+            break
+    if header_idx < 0 or not alt_levels:
+        return {}
+    HIGH_ALTS = {30000, 34000, 39000}
+    for line in lines[header_idx + 1:]:
+        if len(line) < 3:
+            continue
+        row_id = line[:3].strip().upper()
+        if row_id != sid:
+            continue
+        parts = line[3:].split()
+        result: dict[int, tuple] = {}
+        for i, alt in enumerate(alt_levels):
+            if i < len(parts):
+                d, s, t = _decode_winds_field(parts[i], high_level=(alt in HIGH_ALTS))
+                result[alt] = (d, s, t)
+            else:
+                result[alt] = (None, None, None)
+        return result
+    return {}
+
+
+def _fmt_wind_row(alt_ft: int, entry: tuple) -> str:
+    """Format one altitude level for display."""
+    d, s, t = entry
+    fl = alt_ft // 100
+    if d is None and s is None:
+        return f"FL{fl:03d}: —"
+    if d == 0 and s == 0:
+        wind = "Light & variable"
+    else:
+        wind = f"{d:03d}° @ {s} kt"
+    temp_str = f"   {'+' if (t or 0) >= 0 else ''}{t}°C" if t is not None else ""
+    return f"`FL{fl:03d}`: {wind}{temp_str}"
+
+
 _HELP_DESC_SUFFIXES = (
     " (Aviation Hub)",
     " (Aviation Hub DB)",
@@ -230,11 +412,22 @@ class AviationHubBot(commands.Bot):
             help_command=None,
         )
         self.http_session: aiohttp.ClientSession | None = None
+        self._full_gnd_twr_config: dict[str, dict[str, Any]] = {}
+        self._full_gnd_twr_state_loaded = False
 
     async def setup_hook(self) -> None:
         self.http_session = aiohttp.ClientSession(
             headers={"User-Agent": "AviationHubDiscord/1.0"},
             timeout=aiohttp.ClientTimeout(total=45),
+        )
+        self._load_full_gnd_twr_alert_state()
+        self.full_gnd_twr_alert_loop.change_interval(
+            seconds=_full_gnd_twr_alert_poll_seconds()
+        )
+        self.full_gnd_twr_alert_loop.start()
+        LOG.info(
+            "Full GND + TWR alert worker ready; polling every %ss when servers opt in.",
+            _full_gnd_twr_alert_poll_seconds(),
         )
         # Sync once per process start (avoid repeating on every reconnect in on_ready → rate limits).
         # Always sync globals so slash commands are available in DMs.
@@ -255,12 +448,11 @@ class AviationHubBot(commands.Bot):
         try:
             if guild_raw:
                 guild = discord.Object(id=int(guild_raw))
-                # Guild sync only uploads *guild* command entries; @bot.tree.command registers globals.
+                # Copy global commands to the guild so they appear instantly (no 1-hour propagation delay).
                 self.tree.copy_global_to(guild=guild)
                 synced = await self.tree.sync(guild=guild)
                 LOG.info(
-                    "Slash commands synced to guild %s (%s commands). "
-                    "Global sync remains enabled for DMs/other servers.",
+                    "Slash commands synced directly to guild %s (%s commands). Instant availability.",
                     guild.id,
                     len(synced),
                 )
@@ -284,7 +476,215 @@ class AviationHubBot(commands.Bot):
                 "Ensure the bot was invited with **applications.commands** scope."
             )
 
+    def _load_full_gnd_twr_alert_state(self) -> None:
+        self._full_gnd_twr_state_loaded = True
+        state_path = _full_gnd_twr_alert_state_file()
+        if not state_path.is_file():
+            return
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            LOG.warning("Could not read full GND + TWR alert state file %s: %s", state_path, exc)
+            return
+        guilds = data.get("guilds") if isinstance(data, dict) else None
+        if not isinstance(guilds, dict):
+            return
+        loaded: dict[str, dict[str, Any]] = {}
+        for guild_id, cfg in guilds.items():
+            if not isinstance(cfg, dict):
+                continue
+            guild_key = str(guild_id).strip()
+            if not guild_key.isdigit():
+                continue
+            channel_id = str(cfg.get("channel_id") or "").strip()
+            alerted_airports = cfg.get("alerted_airports") or []
+            loaded[guild_key] = {
+                "enabled": bool(cfg.get("enabled", False)),
+                "channel_id": channel_id if channel_id.isdigit() else "",
+                "initialized": bool(cfg.get("initialized", False)),
+                "alerted_airports": sorted(
+                    {
+                        str(icao).strip().upper()
+                        for icao in alerted_airports
+                        if len(str(icao).strip()) == 4
+                    }
+                ),
+            }
+        self._full_gnd_twr_config = loaded
+
+    def _save_full_gnd_twr_alert_state(self) -> None:
+        state_path = _full_gnd_twr_alert_state_file()
+        payload = {
+            "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "guilds": self._full_gnd_twr_config,
+        }
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            LOG.warning("Could not write full GND + TWR alert state file %s: %s", state_path, exc)
+
+    def _full_gnd_twr_enabled_configs(self) -> dict[str, dict[str, Any]]:
+        return {
+            guild_id: cfg
+            for guild_id, cfg in self._full_gnd_twr_config.items()
+            if cfg.get("enabled") and str(cfg.get("channel_id") or "").isdigit()
+        }
+
+    def set_full_gnd_twr_alerts(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        enabled: bool,
+    ) -> dict[str, Any]:
+        if not self._full_gnd_twr_state_loaded:
+            self._load_full_gnd_twr_alert_state()
+        guild_key = str(guild_id)
+        cfg = self._full_gnd_twr_config.setdefault(
+            guild_key,
+            {"enabled": False, "channel_id": "", "initialized": False, "alerted_airports": []},
+        )
+        cfg["enabled"] = enabled
+        cfg["channel_id"] = str(channel_id)
+        if enabled:
+            cfg["initialized"] = False
+            cfg["alerted_airports"] = []
+        cfg.setdefault("alerted_airports", [])
+        self._save_full_gnd_twr_alert_state()
+        return cfg
+
+    def get_full_gnd_twr_alerts(self, guild_id: int) -> dict[str, Any] | None:
+        if not self._full_gnd_twr_state_loaded:
+            self._load_full_gnd_twr_alert_state()
+        return self._full_gnd_twr_config.get(str(guild_id))
+
+    async def _full_gnd_twr_alert_channel(self, channel_id: int) -> Any | None:
+        if channel_id <= 0:
+            return None
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(channel_id)
+            except discord.HTTPException as exc:
+                LOG.warning("Could not fetch full GND + TWR alert channel %s: %s", channel_id, exc)
+                return None
+        if not hasattr(channel, "send"):
+            LOG.warning("Full GND + TWR alert channel %s is not messageable.", channel_id)
+            return None
+        return channel
+
+    async def _send_full_gnd_twr_alert(self, channel_id: int, airport: dict[str, Any]) -> None:
+        channel = await self._full_gnd_twr_alert_channel(channel_id)
+        if channel is None:
+            return
+        icao = str(airport.get("icao") or "?").upper()
+        name = airport.get("name") or "Airport"
+        country = airport.get("country") or "—"
+        controllers = airport.get("controllers") or []
+        controller_lines = []
+        for controller in controllers[:8]:
+            callsign = controller.get("callsign") or "?"
+            facility = controller.get("facility_label") or controller.get("facility") or "ATC"
+            name_or_cid = controller.get("name") or controller.get("cid") or "Unknown"
+            controller_lines.append(f"• `{callsign}` {facility} · {name_or_cid}")
+        if len(controllers) > 8:
+            controller_lines.append(f"… +{len(controllers) - 8} more")
+        message = "\n".join(
+            [
+                f"**{icao} now has GND + TWR online**",
+                f"**{name}** · {country}",
+                "",
+                f"**VATSIM controllers ({airport.get('controller_count', len(controllers))})**",
+                "\n".join(controller_lines) or "No controller details returned.",
+                "",
+                "Aviation Hub live VATSIM coverage alert",
+            ]
+        )
+        await channel.send(content=_truncate(message, 2000))
+
+    @tasks.loop(seconds=60)
+    async def full_gnd_twr_alert_loop(self) -> None:
+        await self.wait_until_ready()
+        session = self.http_session
+        if session is None:
+            return
+        enabled_configs = self._full_gnd_twr_enabled_configs()
+        if not enabled_configs:
+            return
+        status, data = await _hub_get(
+            session,
+            "/api/vatsim/airports",
+            limit=200,
+            has_gnd=1,
+            has_twr=1,
+            sort="icao",
+        )
+        if status != 200:
+            LOG.warning(
+                "Full GND + TWR alert poll failed: status=%s error=%r",
+                status,
+                data.get("error") if isinstance(data, dict) else data,
+            )
+            return
+        airports = data.get("airports") if isinstance(data, dict) else []
+        if not isinstance(airports, list):
+            LOG.warning("Full GND + TWR alert poll returned unexpected payload: %r", data)
+            return
+
+        online = {
+            str(airport.get("icao") or "").strip().upper()
+            for airport in airports
+            if (
+                isinstance(airport, dict)
+                and len(str(airport.get("icao") or "").strip()) == 4
+                and _airport_controller_count(airport) >= FULL_GND_TWR_ALERT_MIN_CONTROLLERS
+            )
+        }
+        if not self._full_gnd_twr_state_loaded:
+            self._load_full_gnd_twr_alert_state()
+
+        airport_by_icao = {
+            str(airport.get("icao") or "").strip().upper(): airport
+            for airport in airports
+            if (
+                isinstance(airport, dict)
+                and _airport_controller_count(airport) >= FULL_GND_TWR_ALERT_MIN_CONTROLLERS
+            )
+        }
+        for guild_id, cfg in enabled_configs.items():
+            alerted = {
+                str(icao).strip().upper()
+                for icao in (cfg.get("alerted_airports") or [])
+                if len(str(icao).strip()) == 4
+            }
+            channel_id = int(cfg["channel_id"])
+            if not cfg.get("initialized"):
+                cfg["initialized"] = True
+                cfg["alerted_airports"] = sorted(online)
+                continue
+            for icao in sorted(online - alerted):
+                airport = airport_by_icao.get(icao)
+                if not airport:
+                    continue
+                try:
+                    await self._send_full_gnd_twr_alert(channel_id, airport)
+                except discord.HTTPException as exc:
+                    LOG.warning(
+                        "Could not send full GND + TWR alert for guild %s: %s",
+                        guild_id,
+                        exc,
+                    )
+            cfg["alerted_airports"] = sorted(online)
+        self._save_full_gnd_twr_alert_state()
+
+    @full_gnd_twr_alert_loop.error
+    async def full_gnd_twr_alert_loop_error(self, error: Exception) -> None:
+        LOG.exception("Full GND + TWR alert loop failed: %s", error)
+
     async def close(self) -> None:
+        if self.full_gnd_twr_alert_loop.is_running():
+            self.full_gnd_twr_alert_loop.cancel()
         if self.http_session:
             await self.http_session.close()
         await super().close()
@@ -1626,21 +2026,22 @@ async def cmd_help(interaction: discord.Interaction) -> None:
     cmds = list(bot.tree.get_commands())
     by_name = {c.name: c for c in cmds}
 
-    weather_names = ("atis", "metar", "sigmet", "taf", "weather")
-    airport_names = ("airport", "runway", "sat", "spicy", "summary")
-    vatsim_names = ("bookings", "events", "inbounds", "ranked", "upcoming", "vatsim")
+    weather_names = ("atis", "metar", "pirep", "sigmet", "taf", "weather", "winds")
+    airport_names = ("airport", "charts", "nearby", "runway", "sat", "spicy", "summary", "xwind")
+    network_names = ("bookings", "events", "inbounds", "ivao", "ranked", "stats", "upcoming", "vatsim", "vatsimcount")
     simbrief_names = ("airlines", "myplan", "postflight")
-    meta_names = ("help", "info", "ping")
+    utility_names = ("convert", "distance")
+    meta_names = ("gnd-twr-alerts", "help", "info", "ping")
 
     def pick(names: tuple[str, ...]) -> list[app_commands.AppCommand]:
         return [by_name[n] for n in names if n in by_name]
 
     weather_cmds = pick(weather_names)
     airport_cmds = pick(airport_names)
-    vatsim_cmds = pick(vatsim_names)
+    network_cmds = pick(network_names)
     simbrief_cmds = pick(simbrief_names)
     meta_cmds = pick(meta_names)
-    known = set(weather_names) | set(airport_names) | set(vatsim_names) | set(simbrief_names) | set(meta_names)
+    known = set(weather_names) | set(airport_names) | set(network_names) | set(simbrief_names) | set(utility_names) | set(meta_names)
     other_cmds = [c for c in cmds if c.name not in known]
 
     embed = discord.Embed(
@@ -1660,8 +2061,8 @@ async def cmd_help(interaction: discord.Interaction) -> None:
         inline=False,
     )
     embed.add_field(
-        name="VATSIM & traffic",
-        value=_truncate(_help_embed_field_lines(vatsim_cmds), 1024) or "—",
+        name="Online networks & traffic",
+        value=_truncate(_help_embed_field_lines(network_cmds), 1024) or "—",
         inline=False,
     )
     embed.add_field(
@@ -1669,9 +2070,24 @@ async def cmd_help(interaction: discord.Interaction) -> None:
         value=_truncate(_help_embed_field_lines(simbrief_cmds), 1024) or "—",
         inline=False,
     )
+    utility_cmds = pick(utility_names)
+    embed.add_field(
+        name="Utilities",
+        value=_truncate(_help_embed_field_lines(utility_cmds), 1024) or "—",
+        inline=False,
+    )
     embed.add_field(
         name="Bot",
         value=_truncate(_help_embed_field_lines(meta_cmds), 1024) or "—",
+        inline=False,
+    )
+    embed.add_field(
+        name="Server alerts",
+        value=(
+            "Use **`/gnd-twr-alerts enabled:true`** in the channel where alerts should post. "
+            "Use **`/gnd-twr-alerts enabled:false`** to turn them off. "
+            "Requires **Manage Server**."
+        ),
         inline=False,
     )
     if other_cmds:
@@ -1728,6 +2144,58 @@ async def cmd_ping(interaction: discord.Interaction) -> None:
     else:
         ws = f"**{round(lat * 1000)}** ms"
     await interaction.response.send_message(f"Pong — Discord gateway: {ws}")
+
+
+@bot.tree.command(
+    name="gnd-twr-alerts",
+    description="Enable or disable GND + TWR online alerts for this server",
+)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(
+    enabled="Turn alerts on or off for this Discord server",
+)
+async def cmd_gnd_twr_alerts(
+    interaction: discord.Interaction,
+    enabled: bool,
+) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This setting can only be changed inside a Discord server.",
+            ephemeral=True,
+        )
+        return
+    target = interaction.channel
+    if target is None or not hasattr(target, "id"):
+        await interaction.response.send_message(
+            "I couldn't work out which channel to use.",
+            ephemeral=True,
+        )
+        return
+    bot_member = interaction.guild.me
+    if isinstance(target, discord.TextChannel) and bot_member is not None:
+        perms = target.permissions_for(bot_member)
+        if not perms.send_messages:
+            await interaction.response.send_message(
+                f"I need Send Messages in {target.mention} before I can post alerts here.",
+                ephemeral=True,
+            )
+            return
+
+    cfg = bot.set_full_gnd_twr_alerts(
+        guild_id=interaction.guild.id,
+        channel_id=int(target.id),
+        enabled=enabled,
+    )
+    if enabled:
+        await interaction.response.send_message(
+            f"GND + TWR alerts are now **on** for this server in <#{cfg['channel_id']}>.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            "GND + TWR alerts are now **off** for this server.",
+            ephemeral=True,
+        )
 
 
 # ── SimBrief helpers ──────────────────────────────────────────────────────────
@@ -2085,6 +2553,781 @@ async def cmd_postflight(interaction: discord.Interaction, simbrief_username: st
     await interaction.followup.send(
         f"🛫 Flight plan for `{simbrief_username}` — `{dep}` → `{arr}`\n```\n{message}\n```"
     )
+
+
+# ── New utility / external-API commands ──────────────────────────────────────
+
+
+@bot.tree.command(
+    name="pirep",
+    description="Recent PIREPs near an airport (AviationWeather.gov, last 6 hours, 200 nm radius)",
+)
+@app_commands.describe(icao="4-letter ICAO code")
+async def cmd_pirep(interaction: discord.Interaction, icao: str) -> None:
+    session = bot.http_session
+    assert session is not None
+    code = icao.strip().upper()
+    if len(code) != 4 or not code.isalnum():
+        await interaction.response.send_message("ICAO must be 4 alphanumeric characters.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)
+    url = (
+        f"https://aviationweather.gov/api/data/pirep"
+        f"?id={code}&format=json&age=6&distance=200"
+    )
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 204:
+                await interaction.followup.send(
+                    f"No PIREPs within 200 nm of **`{code}`** in the last 6 hours.",
+                )
+                return
+            if resp.status != 200:
+                await interaction.followup.send(
+                    f"AviationWeather returned **{resp.status}** for PIREPs near `{code}`.",
+                    ephemeral=True,
+                )
+                return
+            pireps: list[dict] = await resp.json(content_type=None)
+    except aiohttp.ClientError as exc:
+        LOG.warning("PIREP fetch failed for %s: %s", code, exc)
+        await interaction.followup.send("Could not reach AviationWeather.gov.", ephemeral=True)
+        return
+
+    if not pireps:
+        await interaction.followup.send(
+            f"No PIREPs within 200 nm of **`{code}`** in the last 6 hours.",
+        )
+        return
+
+    lines: list[str] = []
+    for p in pireps[:5]:
+        ac = p.get("acType") or "?"
+        fl = p.get("fltLvl")
+        fl_type = p.get("fltLvlType") or ""
+        lat = p.get("lat")
+        lon = p.get("lon")
+        obs_ts = p.get("obsTime")
+        raw = (p.get("rawOb") or "").strip()
+
+        # Icing
+        icing_parts: list[str] = []
+        for idx in range(1, 3):
+            ice_int = p.get(f"icgInt{idx}") or ""
+            ice_type = p.get(f"icgType{idx}") or ""
+            ice_bas = p.get(f"icgBas{idx}")
+            ice_top = p.get(f"icgTop{idx}")
+            if ice_int:
+                s = f"ICE {ice_int}"
+                if ice_type:
+                    s += f" ({ice_type})"
+                if ice_bas is not None and ice_top is not None:
+                    s += f" {ice_bas}–{ice_top} ft"
+                icing_parts.append(s)
+        # Turbulence
+        turb_parts: list[str] = []
+        for idx in range(1, 3):
+            tb_int = p.get(f"tbInt{idx}") or ""
+            tb_type = p.get(f"tbType{idx}") or ""
+            tb_bas = p.get(f"tbBas{idx}")
+            tb_top = p.get(f"tbTop{idx}")
+            if tb_int:
+                s = f"TURB {tb_int}"
+                if tb_type:
+                    s += f" ({tb_type})"
+                if tb_bas is not None and tb_top is not None:
+                    s += f" {tb_bas}–{tb_top} ft"
+                turb_parts.append(s)
+
+        fl_str = f"FL{fl:03d}" if isinstance(fl, int) and fl > 0 else (fl_type or "—")
+        time_str = f"<t:{obs_ts}:t>" if isinstance(obs_ts, int) else "?"
+        pos_str = f"{lat:.1f},{lon:.1f}" if lat is not None and lon is not None else "?"
+
+        header = f"**{ac}** · {fl_str} · {time_str} · {pos_str}"
+        detail_parts = icing_parts + turb_parts
+        detail = "  ·  ".join(detail_parts) if detail_parts else ""
+        raw_short = _truncate(raw, 120)
+        lines.append(header)
+        if detail:
+            lines.append(f"  {detail}")
+        if raw_short:
+            lines.append(f"  `{raw_short}`")
+        lines.append("")
+
+    embed = discord.Embed(
+        title=f"PIREPs near {code} (last 6 h · 200 nm)",
+        description=_truncate("\n".join(lines).rstrip(), 3900),
+        color=discord.Color.orange(),
+    )
+    embed.set_footer(text=f"{min(len(pireps), 5)} of {len(pireps)} PIREP(s) · AviationWeather.gov")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(
+    name="winds",
+    description="Winds aloft forecast for a US airport (AviationWeather.gov FD data)",
+)
+@app_commands.describe(icao="4-letter ICAO code (US airports only, e.g. KLAX)")
+async def cmd_winds(interaction: discord.Interaction, icao: str) -> None:
+    session = bot.http_session
+    assert session is not None
+    code = icao.strip().upper()
+    if len(code) != 4 or not code.isalnum():
+        await interaction.response.send_message("ICAO must be 4 alphanumeric characters.", ephemeral=True)
+        return
+    # FAA winds data only covers US; US ICAO codes start with K
+    if not code.startswith("K"):
+        await interaction.response.send_message(
+            "Winds aloft data via this endpoint is only available for US airports "
+            "(ICAO code starting with **K**, e.g. `KLAX`, `KJFK`).",
+            ephemeral=True,
+        )
+        return
+    station = code[1:]  # strip leading K → 3-letter FAA ID
+    await interaction.response.defer(thinking=True)
+    url = f"https://aviationweather.gov/api/data/windtemp?id={code}&fcst=06&format=json"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                await interaction.followup.send(
+                    f"AviationWeather returned **{resp.status}** for winds aloft.",
+                    ephemeral=True,
+                )
+                return
+            text = await resp.text()
+    except aiohttp.ClientError as exc:
+        LOG.warning("Winds fetch failed for %s: %s", code, exc)
+        await interaction.followup.send("Could not reach AviationWeather.gov.", ephemeral=True)
+        return
+
+    data = _parse_winds_table(text, station)
+    if not data:
+        await interaction.followup.send(
+            f"No winds aloft data found for station **{station}** (`{code}`).\n"
+            "Note: not all airports have winds aloft data — large FBOs and airline hubs are most likely covered.",
+        )
+        return
+
+    # Extract header validity line from the raw text
+    valid_line = ""
+    for line in text.splitlines():
+        if "VALID" in line.upper():
+            valid_line = line.strip()
+            break
+
+    show_alts = [6000, 9000, 18000, 30000, 39000]
+    display_labels = {6000: "FL060 (~5,000 ft)", 9000: "FL090 (~10,000 ft)", 18000: "FL180", 30000: "FL300", 39000: "FL390"}
+    lines: list[str] = []
+    for alt in show_alts:
+        entry = data.get(alt)
+        if entry:
+            label = display_labels.get(alt, f"FL{alt // 100:03d}")
+            lines.append(f"**{label}**: {_fmt_wind_row(alt, entry).split(': ', 1)[-1]}")
+
+    if not lines:
+        await interaction.followup.send(f"No wind levels decoded for **{station}**.")
+        return
+
+    embed = discord.Embed(
+        title=f"Winds aloft — {code} (station {station})",
+        description="\n".join(lines),
+        color=discord.Color.blurple(),
+    )
+    if valid_line:
+        embed.set_footer(text=_truncate(valid_line, 100) + " · AviationWeather.gov FD data")
+    else:
+        embed.set_footer(text="AviationWeather.gov FD winds aloft")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(
+    name="stats",
+    description="VATSIM member stats: rating, pilot & ATC hours, total connections",
+)
+@app_commands.describe(cid="VATSIM CID (numeric member ID)")
+async def cmd_stats(interaction: discord.Interaction, cid: str) -> None:
+    session = bot.http_session
+    assert session is not None
+    cid_clean = cid.strip()
+    if not cid_clean.isdigit():
+        await interaction.response.send_message("CID must be a numeric VATSIM member ID.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)
+
+    _VATSIM_RATING_LABELS: dict[int, str] = {
+        -1: "Inactive", 0: "Suspended", 1: "OBS", 2: "S1", 3: "S2",
+        4: "S3", 5: "C1", 7: "C3", 8: "I1", 10: "I3", 11: "SUP", 12: "ADM",
+    }
+    _VATSIM_PILOT_RATING_LABELS: dict[int, str] = {
+        0: "P0", 1: "P1 (PPL)", 3: "P2 (IR)", 7: "P3 (CMEL)", 15: "P4 (ATPL)", 31: "P5",
+    }
+
+    base = "https://api.vatsim.net/v2/members"
+    try:
+        # Fetch profile and stats in parallel
+        async with session.get(f"{base}/{cid_clean}", timeout=aiohttp.ClientTimeout(total=15)) as r_profile:
+            if r_profile.status == 404:
+                await interaction.followup.send(f"CID **{cid_clean}** not found on VATSIM.", ephemeral=True)
+                return
+            if r_profile.status != 200:
+                await interaction.followup.send(
+                    f"VATSIM API returned **{r_profile.status}** for CID {cid_clean}.", ephemeral=True
+                )
+                return
+            profile: dict = await r_profile.json(content_type=None)
+
+        async with session.get(f"{base}/{cid_clean}/stats", timeout=aiohttp.ClientTimeout(total=15)) as r_stats:
+            stats: dict = await r_stats.json(content_type=None) if r_stats.status == 200 else {}
+    except aiohttp.ClientError as exc:
+        LOG.warning("VATSIM stats fetch failed for CID %s: %s", cid_clean, exc)
+        await interaction.followup.send("Could not reach VATSIM API.", ephemeral=True)
+        return
+
+    rating_id = profile.get("rating", 0)
+    pilot_rating_id = profile.get("pilotrating", 0)
+    reg_date = profile.get("reg_date") or ""
+    region = profile.get("region_id") or "—"
+    division = profile.get("division_id") or "—"
+
+    atc_hrs = stats.get("atc", 0.0) or 0.0
+    pilot_hrs = stats.get("pilot", 0.0) or 0.0
+
+    rating_label = _VATSIM_RATING_LABELS.get(rating_id, f"Rating {rating_id}")
+    pilot_rating_label = _VATSIM_PILOT_RATING_LABELS.get(pilot_rating_id, f"P{pilot_rating_id}")
+
+    reg_str = ""
+    if reg_date:
+        try:
+            dt = datetime.fromisoformat(reg_date.replace("Z", "+00:00"))
+            reg_str = dt.strftime("%d %b %Y")
+        except ValueError:
+            reg_str = reg_date[:10]
+
+    lines = [
+        f"**CID:** {cid_clean}",
+        f"**ATC Rating:** {rating_label}",
+        f"**Pilot Rating:** {pilot_rating_label}",
+        f"**Pilot hours:** {pilot_hrs:.1f} h",
+        f"**ATC hours:** {atc_hrs:.1f} h",
+        f"**Region / Division:** {region} / {division}",
+    ]
+    if reg_str:
+        lines.append(f"**Member since:** {reg_str}")
+
+    embed = discord.Embed(
+        title=f"VATSIM member — CID {cid_clean}",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text="Data: api.vatsim.net · hours from public stats")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(
+    name="distance",
+    description="Great-circle distance between two airports",
+)
+@app_commands.describe(icao1="Departure ICAO", icao2="Arrival ICAO")
+async def cmd_distance(interaction: discord.Interaction, icao1: str, icao2: str) -> None:
+    a1 = icao1.strip().upper()
+    a2 = icao2.strip().upper()
+    for code in (a1, a2):
+        if len(code) != 4 or not code.isalnum():
+            await interaction.response.send_message(
+                f"`{code}` is not a valid 4-character ICAO.", ephemeral=True
+            )
+            return
+    ap1 = _AIRPORT_REF.get(a1)
+    ap2 = _AIRPORT_REF.get(a2)
+    missing = [c for c, a in ((a1, ap1), (a2, ap2)) if a is None]
+    if missing:
+        await interaction.response.send_message(
+            f"Airport(s) not found in reference database: {', '.join(f'`{c}`' for c in missing)}",
+            ephemeral=True,
+        )
+        return
+
+    lat1, lon1 = ap1["latitude_deg"], ap1["longitude_deg"]  # type: ignore[index]
+    lat2, lon2 = ap2["latitude_deg"], ap2["longitude_deg"]  # type: ignore[index]
+    dist_nm = _haversine_nm(lat1, lon1, lat2, lon2)
+    dist_km = dist_nm * 1.852
+    bearing = _initial_bearing(lat1, lon1, lat2, lon2)
+
+    n1 = ap1.get("name") or a1  # type: ignore[union-attr]
+    n2 = ap2.get("name") or a2  # type: ignore[union-attr]
+
+    lines = [
+        f"**{a1}** ({n1})",
+        f"**{a2}** ({n2})",
+        "",
+        f"**Distance:** {dist_nm:.0f} nm · {dist_km:.0f} km",
+        f"**Initial bearing:** {bearing:.0f}°T",
+    ]
+    embed = discord.Embed(
+        title=f"Distance — {a1} → {a2}",
+        description="\n".join(lines),
+        color=discord.Color.teal(),
+    )
+    embed.set_footer(text="Great-circle (Haversine) · OurAirports reference data")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="xwind",
+    description="Crosswind & headwind components for each runway at an airport (uses live METAR)",
+)
+@app_commands.describe(icao="4-letter ICAO code")
+async def cmd_xwind(interaction: discord.Interaction, icao: str) -> None:
+    session = bot.http_session
+    assert session is not None
+    code = icao.strip().upper()
+    if len(code) != 4 or not code.isalnum():
+        await interaction.response.send_message("ICAO must be 4 alphanumeric characters.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)
+
+    # Fetch wind and runway data from the hub
+    wx_status, wx_data = await _hub_get(session, "/api/weather/current", icao=code)
+    rwy_status, rwy_data = await _hub_get(session, "/api/airport/runways", icao=code)
+
+    if wx_status != 200:
+        await interaction.followup.send(f"No weather data for **`{code}`** (HTTP {wx_status}).", ephemeral=True)
+        return
+    if rwy_status == 404:
+        await interaction.followup.send(f"No runway data for **`{code}`** in the reference database.")
+        return
+    if rwy_status != 200:
+        await interaction.followup.send(f"Hub returned **{rwy_status}** for runways.", ephemeral=True)
+        return
+
+    wind = wx_data.get("wind") or {}
+    wind_dir = wind.get("dir_degrees")
+    wind_spd = wind.get("speed_kt")
+    wind_gust = wind.get("gust_kt")
+    runways = rwy_data.get("runways") or []
+    ap_name = rwy_data.get("name") or code
+    metar = wx_data.get("metar") or ""
+
+    if wind_dir is None or wind_spd is None:
+        await interaction.followup.send(
+            f"No wind data available in METAR for **`{code}`** — cannot compute components.\n"
+            + (f"`{_truncate(metar, 200)}`" if metar else ""),
+        )
+        return
+
+    if not runways:
+        await interaction.followup.send(f"No runways found for **`{code}`** in reference data.")
+        return
+
+    wind_rad = math.radians(wind_dir)
+    lines: list[str] = []
+    for rwy in runways:
+        for end_id, hdg_key in (
+            (rwy.get("le_ident", "?"), "le_heading_degT"),
+            (rwy.get("he_ident", "?"), "he_heading_degT"),
+        ):
+            hdg = rwy.get(hdg_key)
+            if hdg is None:
+                continue
+            rwy_rad = math.radians(hdg)
+            angle = wind_rad - rwy_rad
+            headwind = wind_spd * math.cos(angle)
+            crosswind = wind_spd * math.sin(angle)
+            hw_str = f"HW {headwind:+.0f} kt" if headwind >= 0 else f"TW {abs(headwind):.0f} kt"
+            xw_str = f"XW {abs(crosswind):.0f} kt"
+            lines.append(f"`{end_id}` ({hdg:.0f}°T) · {hw_str} · {xw_str}")
+        if rwy.get("closed"):
+            lines[-1] += "  — CLOSED"
+
+    wind_str = f"{wind_dir}° @ {wind_spd} kt"
+    if wind_gust:
+        wind_str += f" G{wind_gust} kt"
+
+    embed = discord.Embed(
+        title=f"Crosswind components — {code}",
+        color=discord.Color.dark_teal(),
+    )
+    embed.add_field(name="Surface wind", value=wind_str, inline=False)
+    embed.add_field(
+        name=f"Runway components ({len(runways)} runway pair(s))",
+        value=_truncate("\n".join(lines), 1024),
+        inline=False,
+    )
+    embed.set_footer(text=f"{ap_name} · HW = headwind, TW = tailwind, XW = crosswind (absolute)")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(
+    name="nearby",
+    description="Find airports within a radius of the given ICAO",
+)
+@app_commands.describe(
+    icao="Centre airport ICAO",
+    radius_nm="Search radius in nm (default 50, max 200)",
+)
+async def cmd_nearby(
+    interaction: discord.Interaction,
+    icao: str,
+    radius_nm: app_commands.Range[int, 1, 200] = 50,
+) -> None:
+    code = icao.strip().upper()
+    if len(code) != 4 or not code.isalnum():
+        await interaction.response.send_message("ICAO must be 4 alphanumeric characters.", ephemeral=True)
+        return
+    centre = _AIRPORT_REF.get(code)
+    if centre is None:
+        await interaction.response.send_message(
+            f"**`{code}`** not found in airport reference database.", ephemeral=True
+        )
+        return
+
+    clat, clon = centre["latitude_deg"], centre["longitude_deg"]
+
+    # Rough bounding-box filter first (1° lat ≈ 60 nm)
+    lat_margin = radius_nm / 60.0 + 0.5
+    lon_margin = radius_nm / (60.0 * math.cos(math.radians(clat))) + 0.5
+
+    nearby: list[tuple[float, dict]] = []
+    for ap_icao, ap in _AIRPORT_REF.items():
+        if ap_icao == code:
+            continue
+        lat = ap.get("latitude_deg")
+        lon = ap.get("longitude_deg")
+        if lat is None or lon is None:
+            continue
+        if abs(lat - clat) > lat_margin or abs(lon - clon) > lon_margin:
+            continue
+        dist = _haversine_nm(clat, clon, lat, lon)
+        if dist <= radius_nm:
+            nearby.append((dist, ap))
+
+    nearby.sort(key=lambda x: x[0])
+    top = nearby[:10]
+
+    _type_labels = {
+        "large_airport": "Large",
+        "medium_airport": "Medium",
+        "small_airport": "Small",
+        "heliport": "Heliport",
+        "seaplane_base": "Seaplane",
+        "balloonport": "Balloon",
+        "closed": "Closed",
+    }
+
+    if not top:
+        await interaction.response.send_message(
+            f"No airports found within **{radius_nm} nm** of **`{code}`**.",
+        )
+        return
+
+    lines: list[str] = []
+    for dist, ap in top:
+        ap_icao = ap["icao"]
+        name = ap.get("name") or ap_icao
+        ap_type = _type_labels.get(ap.get("type") or "", ap.get("type") or "?")
+        lines.append(f"`{ap_icao}` · {dist:.0f} nm · {ap_type} · {name}")
+
+    embed = discord.Embed(
+        title=f"Nearby airports — {code} (within {radius_nm} nm)",
+        description=_truncate("\n".join(lines), 3900),
+        color=discord.Color.dark_gray(),
+    )
+    embed.set_footer(text=f"Showing {len(top)} of {len(nearby)} airports · OurAirports reference")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="charts",
+    description="Chart and reference links for an airport",
+)
+@app_commands.describe(icao="4-letter ICAO code")
+async def cmd_charts(interaction: discord.Interaction, icao: str) -> None:
+    code = icao.strip().upper()
+    if len(code) != 4 or not code.isalnum():
+        await interaction.response.send_message("ICAO must be 4 alphanumeric characters.", ephemeral=True)
+        return
+    ap = _AIRPORT_REF.get(code)
+    ap_name = (ap.get("name") if ap else None) or code
+
+    links: list[str] = [
+        f"[SkyVector](https://skyvector.com/airport/{code})",
+        f"[FlightAware](https://www.flightaware.com/resources/airport/{code})",
+        f"[Autorouter](https://www.autorouter.aero/airports/{code})",
+        f"[OurAirports](https://ourairports.com/airports/{code}/)",
+    ]
+
+    # UK airports: AIP via NATS Aurora
+    if code.startswith("EG"):
+        links.append("[UK AIP (NATS)](https://www.aurora.nats.co.uk/htmlAIP/Publications/current-en-GB/html/index-en-GB.html)")
+
+    # US airports: FAA digital products
+    if code.startswith("K"):
+        faa_id = code[1:]  # 3-letter FAA identifier
+        links.append(
+            f"[FAA Chart Supplement](https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/dafd/)"
+        )
+        links.append(
+            f"[FAA D-TPP Approach Charts](https://www.faa.gov/air_traffic/flight_info/aeronav/digital_products/dtpp/)"
+        )
+
+    embed = discord.Embed(
+        title=f"Charts & references — {code}",
+        description=f"**{ap_name}**\n\n" + "  ·  ".join(links),
+        color=discord.Color.dark_blue(),
+    )
+    embed.set_footer(text="External links · always check NOTAMs before flight")
+    await interaction.response.send_message(embed=embed)
+
+
+_CONVERT_UNITS = [
+    app_commands.Choice(name="hPa (pressure)", value="hpa"),
+    app_commands.Choice(name="inHg (pressure)", value="inhg"),
+    app_commands.Choice(name="ft (altitude)", value="ft"),
+    app_commands.Choice(name="m (metres)", value="m"),
+    app_commands.Choice(name="nm (nautical miles)", value="nm"),
+    app_commands.Choice(name="km (kilometres)", value="km"),
+    app_commands.Choice(name="mi (statute miles)", value="mi"),
+    app_commands.Choice(name="kt (knots)", value="kt"),
+    app_commands.Choice(name="kph (km/h)", value="kph"),
+    app_commands.Choice(name="mph (miles/h)", value="mph"),
+    app_commands.Choice(name="°C (Celsius)", value="c"),
+    app_commands.Choice(name="°F (Fahrenheit)", value="f"),
+]
+
+_CONVERT_GROUPS = {
+    "pressure": {"hpa", "inhg"},
+    "altitude": {"ft", "m"},
+    "distance": {"nm", "km", "mi"},
+    "speed": {"kt", "kph", "mph"},
+    "temperature": {"c", "f"},
+}
+
+_CONVERT_FACTORS: dict[str, dict[str, float]] = {
+    # convert TO base unit (hpa, ft, nm, kt, c) then from base
+    "hpa":  {"hpa": 1.0, "inhg": 0.02953},
+    "inhg": {"hpa": 33.8639, "inhg": 1.0},
+    "ft":   {"ft": 1.0, "m": 0.3048},
+    "m":    {"ft": 3.28084, "m": 1.0},
+    "nm":   {"nm": 1.0, "km": 1.852, "mi": 1.15078},
+    "km":   {"nm": 0.539957, "km": 1.0, "mi": 0.621371},
+    "mi":   {"nm": 0.868976, "km": 1.60934, "mi": 1.0},
+    "kt":   {"kt": 1.0, "kph": 1.852, "mph": 1.15078},
+    "kph":  {"kt": 0.539957, "kph": 1.0, "mph": 0.621371},
+    "mph":  {"kt": 0.868976, "kph": 1.60934, "mph": 1.0},
+}
+
+_CONVERT_UNIT_LABELS: dict[str, str] = {
+    "hpa": "hPa", "inhg": "inHg",
+    "ft": "ft", "m": "m",
+    "nm": "nm", "km": "km", "mi": "mi",
+    "kt": "kt", "kph": "km/h", "mph": "mph",
+    "c": "°C", "f": "°F",
+}
+
+
+def _convert_value(value: float, from_u: str, to_u: str) -> float | None:
+    """Convert value from from_u to to_u. Returns None if conversion not possible."""
+    if from_u == to_u:
+        return value
+    # Temperature special case
+    if from_u == "c" and to_u == "f":
+        return value * 9 / 5 + 32
+    if from_u == "f" and to_u == "c":
+        return (value - 32) * 5 / 9
+    if from_u in {"c", "f"} or to_u in {"c", "f"}:
+        return None  # mixed temperature with other units
+    # Check same group
+    from_group = next((g for g, units in _CONVERT_GROUPS.items() if from_u in units), None)
+    to_group = next((g for g, units in _CONVERT_GROUPS.items() if to_u in units), None)
+    if from_group is None or to_group is None or from_group != to_group:
+        return None
+    # Use the factors dict
+    row = _CONVERT_FACTORS.get(from_u)
+    if row is None:
+        return None
+    factor = row.get(to_u)
+    if factor is None:
+        return None
+    return value * factor
+
+
+@bot.tree.command(
+    name="convert",
+    description="Aviation unit converter: pressure, altitude, distance, speed, temperature",
+)
+@app_commands.describe(
+    value="Numeric value to convert",
+    from_unit="Unit to convert from",
+    to_unit="Unit to convert to",
+)
+@app_commands.choices(from_unit=_CONVERT_UNITS, to_unit=_CONVERT_UNITS)
+async def cmd_convert(
+    interaction: discord.Interaction,
+    value: float,
+    from_unit: app_commands.Choice[str],
+    to_unit: app_commands.Choice[str],
+) -> None:
+    fu = from_unit.value
+    tu = to_unit.value
+    result = _convert_value(value, fu, tu)
+    if result is None:
+        await interaction.response.send_message(
+            f"Cannot convert **{_CONVERT_UNIT_LABELS.get(fu, fu)}** to "
+            f"**{_CONVERT_UNIT_LABELS.get(tu, tu)}** — incompatible unit types.",
+            ephemeral=True,
+        )
+        return
+    from_label = _CONVERT_UNIT_LABELS.get(fu, fu)
+    to_label = _CONVERT_UNIT_LABELS.get(tu, tu)
+    # Format output: avoid excessive decimal places
+    if abs(result) >= 100:
+        result_str = f"{result:.2f}"
+    elif abs(result) >= 1:
+        result_str = f"{result:.4f}"
+    else:
+        result_str = f"{result:.6f}"
+    result_str = result_str.rstrip("0").rstrip(".")
+
+    embed = discord.Embed(
+        title="Unit conversion",
+        description=f"**{value:g} {from_label}** = **{result_str} {to_label}**",
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="vatsimcount",
+    description="Total pilots and controllers currently online on VATSIM",
+)
+async def cmd_vatsimcount(interaction: discord.Interaction) -> None:
+    session = bot.http_session
+    assert session is not None
+    await interaction.response.defer(thinking=True)
+    try:
+        async with session.get(
+            "https://data.vatsim.net/v3/vatsim-data.json",
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                await interaction.followup.send(
+                    f"VATSIM data feed returned **{resp.status}**.", ephemeral=True
+                )
+                return
+            data: dict = await resp.json(content_type=None)
+    except aiohttp.ClientError as exc:
+        LOG.warning("VATSIM count fetch failed: %s", exc)
+        await interaction.followup.send("Could not reach VATSIM data feed.", ephemeral=True)
+        return
+
+    general = data.get("general") or {}
+    connected = general.get("connected_clients", 0)
+    unique = general.get("unique_users", 0)
+    update_ts = general.get("update_timestamp") or ""
+
+    pilots = data.get("pilots") or []
+    controllers = data.get("controllers") or []
+    atis_list = data.get("atis") or []
+
+    pilot_count = len(pilots)
+    atc_count = len(controllers)
+    atis_count = len(atis_list)
+
+    ts = _iso_to_unix(update_ts)
+    update_str = f"<t:{ts}:R>" if ts else update_ts[:19]
+
+    lines = [
+        f"**Pilots online:** {pilot_count:,}",
+        f"**ATC online:** {atc_count:,}",
+        f"**ATIS stations:** {atis_count:,}",
+        f"**Total connected clients:** {connected:,}",
+        f"**Unique users:** {unique:,}",
+        f"**Data updated:** {update_str}",
+    ]
+    embed = discord.Embed(
+        title="VATSIM online now",
+        description="\n".join(lines),
+        color=discord.Color.blue(),
+    )
+    embed.set_footer(text="Source: data.vatsim.net/v3/vatsim-data.json")
+    await interaction.followup.send(embed=embed)
+
+
+def _skylink_api_key() -> str:
+    return os.environ.get("SKYLINK_API_KEY", "").strip()
+
+
+@bot.tree.command(name="notam", description="Active NOTAMs for an airport (SkyLink API)")
+@app_commands.describe(icao="4-letter ICAO code (e.g. EGLL)")
+async def cmd_notam(interaction: discord.Interaction, icao: str) -> None:
+    key = _skylink_api_key()
+    if not key:
+        await interaction.response.send_message(
+            "⚠️ NOTAM lookups are not yet configured — the API key is pending approval.\n"
+            "Check back soon!",
+            ephemeral=True,
+        )
+        return
+
+    code = icao.strip().upper()
+    if len(code) != 4 or not code.isalnum():
+        await interaction.response.send_message("ICAO must be 4 alphanumeric characters.", ephemeral=True)
+        return
+
+    session = bot.http_session
+    assert session is not None
+    await interaction.response.defer(thinking=True)
+
+    try:
+        async with session.get(
+            f"https://skylink-api.p.rapidapi.com/v3/notams/{code}",
+            headers={
+                "x-rapidapi-key": key,
+                "x-rapidapi-host": "skylink-api.p.rapidapi.com",
+            },
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status == 404:
+                await interaction.followup.send(f"No NOTAMs found for **{code}**.", ephemeral=True)
+                return
+            if resp.status != 200:
+                await interaction.followup.send(f"NOTAM API returned **{resp.status}**.", ephemeral=True)
+                return
+            data: dict = await resp.json(content_type=None)
+    except aiohttp.ClientError as exc:
+        LOG.warning("NOTAM fetch failed for %s: %s", code, exc)
+        await interaction.followup.send("Could not reach the NOTAM service. Try again shortly.", ephemeral=True)
+        return
+
+    notams: list[dict] = data.get("notams") or []
+    total: int = data.get("total_count") or len(notams)
+
+    if not notams:
+        await interaction.followup.send(f"No active NOTAMs found for **{code}**.")
+        return
+
+    embed = discord.Embed(
+        title=f"NOTAMs — {code}",
+        description=f"{total} active NOTAM{'s' if total != 1 else ''}  ·  showing {min(5, len(notams))}",
+        color=discord.Color.orange(),
+    )
+
+    for n in notams[:5]:
+        notam_id = n.get("notam_id") or n.get("id") or "—"
+        body = n.get("body") or n.get("text") or n.get("raw") or "No text"
+        effective = n.get("effective_start") or n.get("effective") or ""
+        expires = n.get("effective_end") or n.get("expiration") or "PERM"
+        # Trim long bodies to fit Discord field limits
+        if len(body) > 900:
+            body = body[:897] + "…"
+        value = f"**{effective[:10] if effective else ''}**"
+        if expires:
+            value += f" → {expires[:10]}"
+        value += f"\n```{body}```"
+        embed.add_field(name=notam_id, value=value, inline=False)
+
+    embed.set_footer(text="Source: SkyLink API · FAA SWIM real-time feed")
+    await interaction.followup.send(embed=embed)
 
 
 def main() -> int:

@@ -1,0 +1,13 @@
+{
+  "name": "Aviation Hub",
+  "short_name": "AviHub",
+  "description": "Live VATSIM & IVAO flight simulation dashboard",
+  "start_url": "/dashboard",
+  "display": "standalone",
+  "background_color": "#050505",
+  "theme_color": "#dc2626",
+  "icons": [
+    { "src": "/favicon-32x32.png", "sizes": "32x32", "type": "image/png" },
+    { "src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}

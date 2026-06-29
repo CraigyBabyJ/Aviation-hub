@@ -51,6 +51,15 @@ def main() -> int:
         print(f"DISCORD_GUILD_ID raw repr: {gid_raw[:40]!r}{'…' if len(gid_raw) > 40 else ''}")
         print(f"DISCORD_GUILD_ID normalized: {gid!r}  (must be digits only)")
         print(f"  valid_snowflake: {gid.isdigit() and len(gid) >= 17}")
+
+    poll_raw = _parse_value(raw, "DISCORD_FULL_GND_TWR_ALERT_POLL_SECONDS")
+    print("\nGND + TWR alerts: configured per Discord server with /gnd-twr-alerts")
+    if poll_raw is not None:
+        poll = _strip_env(poll_raw)
+        print(f"DISCORD_FULL_GND_TWR_ALERT_POLL_SECONDS: {poll!r}  (valid_int: {poll.isdigit()})")
+    state_raw = _parse_value(raw, "DISCORD_FULL_GND_TWR_ALERT_STATE_FILE")
+    if state_raw is not None:
+        print(f"DISCORD_FULL_GND_TWR_ALERT_STATE_FILE: {_strip_env(state_raw)!r}")
     return 0
 
 

@@ -11,6 +11,7 @@ import { StatCard } from "@/components/ui/stat-card";
 import { useHub } from "@/lib/hooks/use-hub";
 import type { RankedResponse, EventsResponse, BookingsResponse, SigmetsResponse } from "@/lib/api-types";
 import { motion } from "framer-motion";
+import Link from "next/link";
 
 function StatsBar() {
   const { data: ranked } = useHub<RankedResponse>("airports/ranked", { limit: "20" }, { interval: 30_000 });
@@ -59,7 +60,7 @@ export default function DashboardPage() {
         initial={{ opacity: 0, y: -6 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.4 }}
-        className="flex items-end justify-between mb-5"
+        className="grid grid-cols-1 sm:grid-cols-[1fr_auto_1fr] items-end gap-4 mb-5"
       >
         <div>
           <p className="text-[9px] tracking-[0.28em] uppercase text-zinc-700 mb-1">Operations Console</p>
@@ -67,6 +68,12 @@ export default function DashboardPage() {
             Aviation Hub
           </h1>
         </div>
+        <Link
+          href="/discord-bot"
+          className="justify-self-start sm:justify-self-center rounded border border-red-500/25 bg-red-500/[0.04] px-5 py-2 text-[10px] font-bold uppercase tracking-[0.32em] text-red-100/90 transition-colors hover:border-red-400/45 hover:bg-red-500/10 hover:text-white"
+        >
+          Add Discord Bot
+        </Link>
         <div className="text-right hidden sm:block">
           <p className="text-[9px] tracking-widest uppercase text-zinc-700">Network</p>
           <p className="text-[10px] text-zinc-600 tracking-wide">VATSIM · Live</p>

@@ -138,6 +138,13 @@ export function AirportSearch() {
                 <button onClick={() => handleSearch(query)} className="text-[9px] uppercase tracking-widest text-zinc-600 hover:text-zinc-400 px-2 py-1 border border-white/[0.06] rounded transition-colors">
                   Lookup
                 </button>
+                <button
+                  onClick={() => { setOpen(false); setResult(null); setQuery(""); setError(null); }}
+                  className="ml-1 flex items-center justify-center w-6 h-6 rounded text-zinc-600 hover:text-zinc-300 hover:bg-white/[0.06] transition-colors"
+                  aria-label="Close search"
+                >
+                  <X size={14} />
+                </button>
               </div>
 
               {/* Error */}
