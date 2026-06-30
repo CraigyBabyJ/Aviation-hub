@@ -1876,6 +1876,51 @@ async def cmd_atis(interaction: discord.Interaction, icao: str) -> None:
     await interaction.followup.send(embed=embed)
 
 
+@bot.tree.command(name="ivaoatis", description="Live IVAO ATIS for an airport (Aviation Hub snapshot)")
+@app_commands.describe(icao="4-letter ICAO")
+async def cmd_ivaoatis(interaction: discord.Interaction, icao: str) -> None:
+    session = bot.http_session
+    assert session is not None
+    code = icao.strip().upper()
+    if len(code) != 4 or not code.isalnum():
+        await interaction.response.send_message("ICAO must be 4 alphanumeric characters.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)
+    status, data = await _hub_get(session, "/api/ivao/atis", icao=code)
+    if status == 404:
+        await interaction.followup.send(
+            f"No IVAO ATIS online for **`{code}`** right now — an ATC position with ATIS must be active."
+        )
+        return
+    if status != 200:
+        await interaction.followup.send(f"Hub returned **{status}** for `{code}`.", ephemeral=True)
+        return
+
+    callsign  = data.get("callsign") or f"{code}_ATIS"
+    revision  = data.get("revision") or "?"
+    freq      = data.get("frequency") or "—"
+    text      = data.get("text") or ""
+    updated   = data.get("updated")
+    info_label = f"Information **{revision.upper()}**" if revision and revision != "?" else f"Revision **{revision}**"
+
+    embed = discord.Embed(
+        title=f"IVAO ATIS — {code}  ·  {info_label}",
+        color=discord.Color.blue(),
+    )
+    embed.add_field(name="Station", value=f"`{callsign}`", inline=True)
+    embed.add_field(name="Frequency", value=str(freq), inline=True)
+    if text:
+        embed.add_field(
+            name="Text",
+            value=f"```{_truncate(text, 990)}```",
+            inline=False,
+        )
+    if updated:
+        ts = _iso_to_unix(updated)
+        embed.set_footer(text=f"Last updated: {f'<t:{ts}:R>' if ts else updated}")
+    await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="sigmet", description="Active international SIGMETs (Aviation Hub DB)")
 @app_commands.describe(
     hazard="Filter by hazard type (leave blank for all)",
@@ -2507,7 +2552,7 @@ async def cmd_help(interaction: discord.Interaction) -> None:
     cmds = list(bot.tree.get_commands())
     by_name = {c.name: c for c in cmds}
 
-    weather_names = ("atis", "metar", "pirep", "sigmet", "taf", "weather", "winds")
+    weather_names = ("atis", "ivaoatis", "metar", "pirep", "sigmet", "taf", "weather", "winds")
     airport_names = ("airport", "charts", "nearby", "runway", "sat", "spicy", "summary", "xwind")
     network_names = ("bookings", "events", "inbounds", "ivao", "ivaobookings", "ivaocount", "ivaoevents", "ivaoinbounds", "ivaolookup", "ivaostats", "ranked", "stats", "upcoming", "vatsim", "vatsimcount")
     simbrief_names = ("airlines", "myplan", "postflight")

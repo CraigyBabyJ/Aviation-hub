@@ -78,12 +78,16 @@ def process_ivao_network(conn: sqlite3.Connection, session: requests.Session) ->
         last        = (user.get("lastName") or "").strip()
         name        = f"{first} {last}".strip() or None
 
+        # ATIS lines[0] is an audio stream URL — skip it, join the rest as text
+        atis_lines = atis.get("lines") or []
+        atis_text = "\n".join(atis_lines[1:]).strip() or None
+
         conn.execute(
             """
             INSERT INTO ivao_atc_latest (
                 callsign, user_id, name, rating, frequency, position,
-                latitude, longitude, atis_revision, logon_time, last_updated
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                latitude, longitude, atis_revision, atis_text, logon_time, last_updated
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(callsign)
             DO UPDATE SET
                 user_id       = excluded.user_id,
@@ -94,6 +98,7 @@ def process_ivao_network(conn: sqlite3.Connection, session: requests.Session) ->
                 latitude      = excluded.latitude,
                 longitude     = excluded.longitude,
                 atis_revision = excluded.atis_revision,
+                atis_text     = excluded.atis_text,
                 logon_time    = excluded.logon_time,
                 last_updated  = excluded.last_updated
             """,
@@ -107,6 +112,7 @@ def process_ivao_network(conn: sqlite3.Connection, session: requests.Session) ->
                 to_float(last_track.get("latitude")),
                 to_float(last_track.get("longitude")),
                 atis.get("revision"),
+                atis_text,
                 normalize_iso_utc(client.get("createdAt")),
                 update_timestamp,
             ),

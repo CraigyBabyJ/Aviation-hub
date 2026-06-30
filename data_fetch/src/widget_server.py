@@ -2505,6 +2505,9 @@ class WidgetHandler(BaseHTTPRequestHandler):
             if parsed.path == IVAO_AIRPORT_PATH:
                 self._handle_ivao_airport(parsed.query)
                 return
+            if parsed.path == "/api/ivao/atis":
+                self._handle_ivao_atis(parsed.query)
+                return
             if parsed.path == "/api/ivao/count":
                 self._handle_ivao_count(parsed.query)
                 return
@@ -2751,6 +2754,40 @@ class WidgetHandler(BaseHTTPRequestHandler):
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"error": "ivao_table_unavailable", "detail": str(exc)},
             )
+
+    def _handle_ivao_atis(self, query: str) -> None:
+        icao, error = _parse_icao_from_query(query)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                # Look for any ATC callsign at this airport that has ATIS text
+                rows = conn.execute(
+                    """
+                    SELECT callsign, atis_revision, atis_text, frequency, last_updated
+                    FROM ivao_atc_latest
+                    WHERE callsign LIKE ?
+                      AND atis_text IS NOT NULL AND atis_text != ''
+                    ORDER BY callsign
+                    """,
+                    (f"{icao}_%",),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+            return
+        if not rows:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": f"No IVAO ATIS online for {icao}"})
+            return
+        row = rows[0]
+        self._send_json(HTTPStatus.OK, {
+            "icao":      icao,
+            "callsign":  row["callsign"],
+            "revision":  row["atis_revision"] or "",
+            "text":      row["atis_text"] or "",
+            "frequency": row["frequency"] or "",
+            "updated":   row["last_updated"] or "",
+        })
 
     def _handle_ivao_count(self, query: str) -> None:
         try:

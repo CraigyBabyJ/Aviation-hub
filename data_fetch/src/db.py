@@ -108,6 +108,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             latitude REAL,
             longitude REAL,
             atis_revision TEXT,
+            atis_text TEXT,
             logon_time TEXT,
             last_updated TEXT
         );

@@ -45,6 +45,7 @@ const COMMAND_GROUPS: CommandGroup[] = [
     label: "Weather",
     commands: [
       { name: "/atis", description: "Live VATSIM ATIS for an airport" },
+      { name: "/ivaoatis", description: "Live IVAO ATIS for an airport" },
       { name: "/metar", description: "Raw METAR text from Aviation Hub DB" },
       { name: "/pirep", description: "Recent PIREPs near an airport (last 6 h, 200 nm radius)" },
       { name: "/sigmet", description: "Active international SIGMETs" },
