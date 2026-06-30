@@ -9,11 +9,13 @@ export function Background() {
       {/* Bottom radial glow */}
       <div className="absolute inset-0 bg-radial-dark" />
 
-      {/* Top-left red bleed */}
-      <div className="absolute -top-40 -left-40 w-[600px] h-[600px] rounded-full bg-red-950/10 blur-[120px]" />
+      {/* Top-left accent bleed — follows network theme via CSS var */}
+      <div className="absolute -top-40 -left-40 w-[600px] h-[600px] rounded-full blur-[120px] transition-[background-color] duration-700"
+        style={{ backgroundColor: "rgba(var(--accent), 0.07)" }} />
 
       {/* Bottom-right accent */}
-      <div className="absolute -bottom-40 -right-40 w-[500px] h-[500px] rounded-full bg-red-950/8 blur-[100px]" />
+      <div className="absolute -bottom-40 -right-40 w-[500px] h-[500px] rounded-full blur-[100px] transition-[background-color] duration-700"
+        style={{ backgroundColor: "rgba(var(--accent), 0.05)" }} />
 
       {/* Diagonal grid lines */}
       <div className="absolute inset-0 bg-grid-lines opacity-100" />

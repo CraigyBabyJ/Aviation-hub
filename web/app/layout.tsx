@@ -3,6 +3,7 @@ import "./globals.css";
 import { Navbar } from "@/components/layout/navbar";
 import { Footer } from "@/components/layout/footer";
 import { Background } from "@/components/layout/background";
+import { NetworkProvider } from "@/lib/network-context";
 
 const BASE_URL = "https://aviation-hub.craigybabyj.com";
 
@@ -95,12 +96,14 @@ export default function RootLayout({
         />
       </head>
       <body>
-        <Background />
-        <Navbar />
-        <main className="relative z-10 pt-14 min-h-screen">
-          {children}
-        </main>
-        <Footer />
+        <NetworkProvider>
+          <Background />
+          <Navbar />
+          <main className="relative z-10 pt-14 min-h-screen">
+            {children}
+          </main>
+          <Footer />
+        </NetworkProvider>
       </body>
     </html>
   );

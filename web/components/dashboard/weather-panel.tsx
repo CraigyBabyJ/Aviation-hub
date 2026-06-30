@@ -97,7 +97,7 @@ function WeatherRow({
     <div className="hub-row">
       <button
         onClick={onToggle}
-        className="w-full flex items-center gap-3 py-2.5 text-left hover:bg-white/[0.015] transition-colors -mx-5 px-5"
+        className="w-full flex items-center gap-3 h-[52px] text-left hover:bg-white/[0.015] transition-colors -mx-5 px-5"
       >
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-0.5">
@@ -157,10 +157,10 @@ function WeatherRow({
   );
 }
 
-export function WeatherPanel() {
-  // Single useHub call — aggregation done server-side in /api/hub/weather-summary
+export function WeatherPanel({ icaos }: { icaos?: string[] }) {
+  const params: Record<string, string> = icaos && icaos.length > 0 ? { icaos: icaos.join(",") } : {};
   const { data, loading, error, lastUpdated, refresh } =
-    useHub<WeatherSummaryResponse>("weather-summary", {}, { interval: 60_000 });
+    useHub<WeatherSummaryResponse>("weather-summary", params, { interval: 60_000 });
 
   const airports = data?.airports ?? [];
   const [expanded, setExpanded] = useState<string | null>(null);

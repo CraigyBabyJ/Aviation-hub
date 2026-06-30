@@ -22,7 +22,8 @@ export function SectionHeader({
       <div className="flex items-center gap-3">
         {/* Live dot */}
         {live && (
-          <span className="live-dot mt-0.5 flex-shrink-0 w-1.5 h-1.5 rounded-full bg-red-500 block" />
+          <span className="live-dot mt-0.5 flex-shrink-0 w-1.5 h-1.5 rounded-full block transition-[background-color] duration-500"
+            style={{ backgroundColor: "var(--accent-hex)" }} />
         )}
 
         <div>

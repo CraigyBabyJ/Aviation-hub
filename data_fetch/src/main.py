@@ -27,6 +27,7 @@ from fetchers.ingest_vatsim_atc_bookings import (
 from fetchers.ingest_vatsim_events import FEED_NAME as VATSIM_EVENTS_FEED, process_vatsim_events
 from fetchers.vatsim import FEED_NAME as VATSIM_FEED, next_poll_seconds, process_vatsim_network
 from fetchers.ivao import FEED_NAME as IVAO_FEED, process_ivao_network
+from fetchers.ivao_events import process_ivao_events
 from util import configure_logging, utc_now_iso
 from widget_server import start_widget_server
 
@@ -199,6 +200,10 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
         OURAIRPORTS_FEED: PollState(interval=3600, next_run=0.0),
         IVAO_FEED: PollState(
             interval=_env_poll_seconds("IVAO_POLL_SECONDS", 60),
+            next_run=0.0,
+        ),
+        "ivao_events": PollState(
+            interval=_env_poll_seconds("IVAO_EVENTS_POLL_SECONDS", 1800),  # every 30 min
             next_run=0.0,
         ),
     }
@@ -386,6 +391,19 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
                     last_error_at=utc_now_iso(),
                 )
             polls[IVAO_FEED].next_run = now + polls[IVAO_FEED].interval
+
+        if now >= polls["ivao_events"].next_run:
+            try:
+                LOGGER.info("Checking ivao_events")
+                process_ivao_events(conn, session)
+                # Prune events that ended more than 24 hours ago
+                conn.execute(
+                    "DELETE FROM ivao_events WHERE ends_at IS NOT NULL AND ends_at < datetime('now', '-1 day')"
+                )
+                conn.commit()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("IVAO events processing failed: %s", exc)
+            polls["ivao_events"].next_run = now + polls["ivao_events"].interval
 
         sleep_for = max(1.0, min(state.next_run for state in polls.values()) - time.time())
         STOP_EVENT.wait(timeout=sleep_for)

@@ -101,6 +101,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS ivao_atc_latest (
             callsign TEXT PRIMARY KEY,
             user_id INTEGER,
+            name TEXT,
             rating INTEGER,
             frequency TEXT,
             position TEXT,
@@ -114,6 +115,49 @@ def init_db(conn: sqlite3.Connection) -> None:
             ON ivao_atc_latest (last_updated);
         CREATE INDEX IF NOT EXISTS idx_ivao_atc_position
             ON ivao_atc_latest (position);
+
+        -- IVAO online pilot snapshot (mirrors vatsim_pilots_latest; fed by
+        -- fetchers/ivao.py from the IVAO whazzup v2 feed).
+        -- IVAO events scraped from ivao.events (listing + detail pages).
+        -- event_id is the numeric ID from the URL. detail_fetched_at tracks when
+        -- the detail page was last scraped so we only re-fetch if stale.
+        CREATE TABLE IF NOT EXISTS ivao_events (
+            event_id        TEXT PRIMARY KEY,
+            title           TEXT,
+            date_label      TEXT,
+            time_label      TEXT,
+            starts_at       TEXT,
+            ends_at         TEXT,
+            airports        TEXT,
+            description     TEXT,
+            image           TEXT,
+            url             TEXT,
+            detail_fetched_at TEXT,
+            first_seen_at   TEXT NOT NULL,
+            last_seen_at    TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ivao_events_starts_at
+            ON ivao_events (starts_at);
+
+        CREATE TABLE IF NOT EXISTS ivao_pilots_latest (
+            callsign TEXT PRIMARY KEY,
+            user_id INTEGER,
+            latitude REAL,
+            longitude REAL,
+            altitude INTEGER,
+            groundspeed INTEGER,
+            heading INTEGER,
+            aircraft_type TEXT,
+            departure TEXT,
+            arrival TEXT,
+            last_updated TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_ivao_pilots_last_updated
+            ON ivao_pilots_latest (last_updated);
+        CREATE INDEX IF NOT EXISTS idx_ivao_pilots_arrival
+            ON ivao_pilots_latest (arrival);
+        CREATE INDEX IF NOT EXISTS idx_ivao_pilots_departure
+            ON ivao_pilots_latest (departure);
 
         CREATE TABLE IF NOT EXISTS metar_latest (
             icao TEXT PRIMARY KEY,

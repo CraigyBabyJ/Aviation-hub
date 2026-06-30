@@ -13,6 +13,24 @@
   --glow: rgba(255, 255, 255, 0.25);
   --red: #dc2626;
   --red-dim: rgba(220, 38, 38, 0.15);
+
+  /* Network accent — VATSIM red by default */
+  --accent:        220, 38, 38;   /* rgb components for rgba() use */
+  --accent-hex:    #dc2626;
+  --accent-dim:    rgba(220, 38, 38, 0.12);
+  --accent-glow:   rgba(220, 38, 38, 0.20);
+  --accent-border: rgba(220, 38, 38, 0.40);
+  --accent-text:   #f87171;       /* red-400 */
+}
+
+/* IVAO theme overrides */
+[data-network="ivao"] {
+  --accent:        59, 130, 246;
+  --accent-hex:    #3b82f6;
+  --accent-dim:    rgba(59, 130, 246, 0.10);
+  --accent-glow:   rgba(59, 130, 246, 0.18);
+  --accent-border: rgba(59, 130, 246, 0.38);
+  --accent-text:   #60a5fa;       /* blue-400 */
 }
 
 * {
@@ -28,7 +46,7 @@ body {
   background-image:
     /* bottom radial glow */
     radial-gradient(ellipse 100% 60% at 50% 100%, rgba(255, 255, 255, 0.03) 0%, transparent 70%),
-    /* subtle top glow */
+    /* subtle top glow — overridden per network via pseudo-element */
     radial-gradient(ellipse 60% 30% at 50% 0%, rgba(220, 38, 38, 0.04) 0%, transparent 60%),
     /* noise texture via SVG data URI */
     url("data:image/svg+xml,%3Csvg viewBox='0 0 512 512' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
@@ -90,8 +108,9 @@ body {
   position: absolute;
   width: 12px;
   height: 12px;
-  border-color: rgba(220, 38, 38, 0.6);
+  border-color: rgba(var(--accent), 0.6);
   border-style: solid;
+  transition: border-color 0.4s ease;
 }
 
 .corner-accent::before {
@@ -127,6 +146,57 @@ body {
 .radar-sweep {
   animation: radar-sweep 4s linear infinite;
   transform-origin: center;
+}
+
+/* ── Network theme: IVAO blue overrides ─────────────────────────────────── */
+/* Applied globally when data-network="ivao" is set on <html>.              */
+/* Semantic reds (IFR weather, SIGMETs, error states, Discord button)       */
+/* are intentionally excluded from these overrides.                          */
+
+/* Live/pulse dots */
+[data-network="ivao"] .accent-dot,
+[data-network="ivao"] .live-dot {
+  background-color: var(--accent-hex) !important;
+}
+
+/* Active filter pills — used on traffic, atc, events pages */
+[data-network="ivao"] .accent-pill-active {
+  background-color: rgba(var(--accent), 0.18) !important;
+  border-color:     rgba(var(--accent), 0.50) !important;
+  color:            var(--accent-text) !important;
+}
+
+/* Sort arrow */
+[data-network="ivao"] .accent-arrow {
+  color: var(--accent-text) !important;
+}
+
+/* Search input focus ring */
+[data-network="ivao"] .accent-search:focus {
+  border-color: rgba(var(--accent), 0.50) !important;
+}
+
+/* Active event card border */
+[data-network="ivao"] .accent-card-active {
+  border-color: rgba(var(--accent), 0.30) !important;
+  background-color: rgba(var(--accent), 0.05) !important;
+}
+
+/* Booking active row */
+[data-network="ivao"] .booking-active-row {
+  background-color: rgba(var(--accent), 0.05) !important;
+}
+
+/* CTR badge */
+[data-network="ivao"] .badge-ctr {
+  color:            var(--accent-text) !important;
+  border-color:     rgba(var(--accent), 0.30) !important;
+  background-color: rgba(var(--accent), 0.12) !important;
+}
+
+/* Map corner accent lines */
+[data-network="ivao"] .map-accent-line {
+  background-color: rgba(var(--accent), 0.50) !important;
 }
 
 /* Table row hover */

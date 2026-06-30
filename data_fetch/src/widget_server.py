@@ -39,11 +39,14 @@ VATSIM_EVENTS_PATH = "/api/vatsim/events"
 VATSIM_BOOKINGS_PATH = "/api/vatsim/bookings"
 VATSIM_INBOUNDS_PATH = "/api/vatsim/inbounds"
 VATSIM_LOOKUP_PATH = "/api/vatsim/lookup"
-IVAO_AIRPORT_PATH = "/api/ivao/airport"
+IVAO_AIRPORT_PATH      = "/api/ivao/airport"
+IVAO_CONTROLLERS_PATH  = "/api/ivao/controllers"
+IVAO_PILOTS_PATH       = "/api/ivao/pilots"
 AIRPORT_BRIEF_PATH = "/api/airport/brief"
 SIGMETS_PATH = "/api/sigmets"
 AIRPORT_RUNWAYS_PATH = "/api/airport/runways"
 SATELLITE_IMAGE_PATH = "/api/satellite"
+AIRPORTS_WEATHER_PATH = "/api/airports/weather"
 HTTP_ROUTES = {
     "current_spicy_airports": WIDGET_PATH,
     "weather_current": WEATHER_CURRENT_PATH,
@@ -66,7 +69,11 @@ HTTP_ROUTES = {
     "airport_brief": AIRPORT_BRIEF_PATH,
     "sigmets": SIGMETS_PATH,
     "airport_runways": AIRPORT_RUNWAYS_PATH,
-    "satellite": SATELLITE_IMAGE_PATH,
+    "satellite":        SATELLITE_IMAGE_PATH,
+    "airports_weather":   AIRPORTS_WEATHER_PATH,
+    "ivao_controllers":   IVAO_CONTROLLERS_PATH,
+    "ivao_pilots":        IVAO_PILOTS_PATH,
+    "ivao_events":        "/api/ivao/events",
 }
 
 # VATSIM controller facility codes (see VATSIM API / network documentation).
@@ -862,6 +869,30 @@ def build_airport_status_payload(conn: sqlite3.Connection, icao: str) -> dict[st
     }
 
 
+def build_airports_weather_payload(conn: sqlite3.Connection, icaos: list[str]) -> dict[str, Any]:
+    """Return challenge_level, overall_score, flight_category, wx_summary for a list of airports."""
+    if not icaos:
+        return {"airports": {}}
+    placeholders = ",".join("?" * len(icaos))
+    rows = conn.execute(
+        f"""
+        SELECT airport, overall_score, challenge_level, flight_category, wx_summary
+        FROM airport_live_status_latest
+        WHERE airport IN ({placeholders})
+        """,
+        icaos,
+    ).fetchall()
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        result[row["airport"]] = {
+            "overall_score":   row["overall_score"],
+            "challenge_level": row["challenge_level"],
+            "flight_category": row["flight_category"],
+            "wx_summary":      row["wx_summary"],
+        }
+    return {"airports": result}
+
+
 def _build_vatsim_airport_entries(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
     airports: dict[str, dict[str, Any]] = {}
 
@@ -1545,48 +1576,50 @@ def build_vatsim_bookings_list_payload(
 ) -> dict[str, Any]:
     """Scheduled ATC bookings from `vatsim_atc_bookings_latest` (advisory; not live coverage)."""
     now_marker = utc_now_iso().replace("+00:00", "Z")
+    name_join = """
+        LEFT JOIN (
+            SELECT cid, name FROM vatsim_controllers_latest
+            UNION ALL
+            SELECT cid, name FROM vatsim_pilots_latest
+        ) AS known ON known.cid = b.controller_cid
+    """
+    base_cols = """
+                b.booking_id,
+                b.callsign,
+                b.airport_icao,
+                b.fir_icao,
+                b.position_type,
+                b.starts_at_utc,
+                b.ends_at_utc,
+                b.booking_type,
+                b.controller_cid,
+                b.fetched_at_utc,
+                known.name AS controller_name
+    """
     if icao:
         rows = conn.execute(
-            """
-            SELECT
-                booking_id,
-                callsign,
-                airport_icao,
-                fir_icao,
-                position_type,
-                starts_at_utc,
-                ends_at_utc,
-                booking_type,
-                controller_cid,
-                fetched_at_utc
-            FROM vatsim_atc_bookings_latest
-            WHERE ends_at_utc >= ?
+            f"""
+            SELECT {base_cols}
+            FROM vatsim_atc_bookings_latest b
+            {name_join}
+            WHERE b.ends_at_utc >= ?
               AND (
-                    UPPER(TRIM(airport_icao)) = ?
-                 OR UPPER(callsign) LIKE ?
+                    UPPER(TRIM(b.airport_icao)) = ?
+                 OR UPPER(b.callsign) LIKE ?
               )
-            ORDER BY starts_at_utc ASC
+            ORDER BY b.starts_at_utc ASC
             LIMIT ?
             """,
             (now_marker, icao, f"{icao}_%", limit),
         ).fetchall()
     else:
         rows = conn.execute(
-            """
-            SELECT
-                booking_id,
-                callsign,
-                airport_icao,
-                fir_icao,
-                position_type,
-                starts_at_utc,
-                ends_at_utc,
-                booking_type,
-                controller_cid,
-                fetched_at_utc
-            FROM vatsim_atc_bookings_latest
-            WHERE ends_at_utc >= ?
-            ORDER BY starts_at_utc ASC
+            f"""
+            SELECT {base_cols}
+            FROM vatsim_atc_bookings_latest b
+            {name_join}
+            WHERE b.ends_at_utc >= ?
+            ORDER BY b.starts_at_utc ASC
             LIMIT ?
             """,
             (now_marker, limit),
@@ -1605,6 +1638,7 @@ def build_vatsim_bookings_list_payload(
                 "ends_at_utc": row["ends_at_utc"],
                 "booking_type": row["booking_type"],
                 "controller_cid": row["controller_cid"],
+                "controller_name": row["controller_name"],
             }
         )
     return {
@@ -2208,6 +2242,35 @@ def build_airports_ranked_payload(
     rows_out.sort(key=lambda x: (-x["rank_score"], x["airport"]))
     top = rows_out[:limit]
 
+    # Enrich with live controller list for tooltip display
+    top_icaos = [r["airport"] for r in top]
+    controllers_by_ap: dict[str, list[dict[str, str]]] = {ap: [] for ap in top_icaos}
+    if top_icaos:
+        placeholders = ",".join("?" * len(top_icaos))
+        FAC_LABEL = {0:"OBS",1:"FSS",2:"DEL",3:"GND",4:"TWR",5:"APP",6:"CTR",7:"ATIS"}
+        try:
+            for row in conn.execute(
+                f"""
+                SELECT callsign, name, facility
+                FROM vatsim_controllers_latest
+                WHERE UPPER(SUBSTR(callsign, 1, 4)) IN ({placeholders})
+                  AND facility != 0
+                ORDER BY facility DESC, callsign
+                """,
+                top_icaos,
+            ):
+                ap = (row["callsign"] or "")[:4].upper()
+                if ap in controllers_by_ap:
+                    controllers_by_ap[ap].append({
+                        "callsign": row["callsign"],
+                        "name":     row["name"] or "",
+                        "facility": FAC_LABEL.get(row["facility"], ""),
+                    })
+        except sqlite3.OperationalError:
+            pass
+    for r in top:
+        r["controllers"] = controllers_by_ap.get(r["airport"], [])
+
     return {
         "generated_at": utc_now_iso(),
         "hours": hours,
@@ -2442,11 +2505,23 @@ class WidgetHandler(BaseHTTPRequestHandler):
             if parsed.path == IVAO_AIRPORT_PATH:
                 self._handle_ivao_airport(parsed.query)
                 return
+            if parsed.path == IVAO_CONTROLLERS_PATH:
+                self._handle_ivao_controllers(parsed.query)
+                return
+            if parsed.path == IVAO_PILOTS_PATH:
+                self._handle_ivao_pilots(parsed.query)
+                return
+            if parsed.path == "/api/ivao/events":
+                self._handle_ivao_events(parsed.query)
+                return
             if parsed.path == AIRPORTS_UPCOMING_PATH:
                 self._handle_airports_upcoming(parsed.query)
                 return
             if parsed.path == AIRPORTS_RANKED_PATH:
                 self._handle_airports_ranked(parsed.query)
+                return
+            if parsed.path == AIRPORTS_WEATHER_PATH:
+                self._handle_airports_weather(parsed.query)
                 return
             if parsed.path == VATSIM_AIRPORTS_PATH:
                 self._handle_vatsim_airports(parsed.query)
@@ -2568,6 +2643,17 @@ class WidgetHandler(BaseHTTPRequestHandler):
             return
         self._send_json(HTTPStatus.OK, payload)
 
+    def _handle_airports_weather(self, query: str) -> None:
+        params = urllib.parse.parse_qs(query)
+        raw = params.get("icaos", [""])[0]
+        icaos = [i.strip().upper() for i in raw.split(",") if i.strip()][:40]
+        if not icaos:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "icaos_required"})
+            return
+        with _open_readonly_connection(self.db_path) as conn:
+            payload = build_airports_weather_payload(conn, icaos)
+        self._send_json(HTTPStatus.OK, payload)
+
     def _handle_airport_summary(self, query: str) -> None:
         icao, error = _parse_icao_from_query(query)
         if error:
@@ -2647,6 +2733,126 @@ class WidgetHandler(BaseHTTPRequestHandler):
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"error": "ivao_table_unavailable", "detail": str(exc)},
             )
+
+    def _handle_ivao_controllers(self, query: str) -> None:
+        IVAO_RATING: dict[int, str] = {
+            1: "AS1", 2: "AS2", 3: "AS3", 4: "ADC",
+            5: "APC", 6: "ACC", 7: "SEC", 8: "SAI", 9: "CAI",
+        }
+        POSITION_ORDER = ["CTR", "APP", "TWR", "GND", "DEL", "ATIS", "FSS"]
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT callsign, user_id, name, rating, frequency, position,
+                           latitude, longitude, logon_time, last_updated
+                    FROM ivao_atc_latest
+                    WHERE position IS NOT NULL AND position != 'OBS'
+                    ORDER BY callsign
+                    """
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+            return
+
+        def _logon_minutes(logon_time: str | None) -> int:
+            if not logon_time:
+                return 0
+            try:
+                import datetime
+                lt = datetime.datetime.fromisoformat(logon_time.replace("Z", "+00:00"))
+                now = datetime.datetime.now(datetime.timezone.utc)
+                return max(0, int((now - lt).total_seconds() // 60))
+            except Exception:
+                return 0
+
+        controllers = sorted([
+            {
+                "callsign":      row["callsign"],
+                "name":          row["name"] or "",
+                "cid":           row["user_id"] or "",
+                "frequency":     row["frequency"] or "",
+                "facility":      0,
+                "facility_label": row["position"] or "",
+                "rating":        row["rating"] or 0,
+                "rating_label":  IVAO_RATING.get(row["rating"] or 0, "—"),
+                "airport":       (row["callsign"] or "").split("_")[0],
+                "logon_time":    row["logon_time"] or "",
+                "logon_minutes": _logon_minutes(row["logon_time"]),
+                "visual_range":  0,
+                "atis":          "",
+            }
+            for row in rows
+        ], key=lambda c: (
+            POSITION_ORDER.index(c["facility_label"]) if c["facility_label"] in POSITION_ORDER else 99,
+            c["callsign"],
+        ))
+        self._send_json(HTTPStatus.OK, {"controllers": controllers, "total": len(controllers)})
+
+    def _handle_ivao_pilots(self, query: str) -> None:
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT callsign, latitude, longitude, altitude, groundspeed,
+                           heading, aircraft_type, departure, arrival
+                    FROM ivao_pilots_latest
+                    ORDER BY callsign
+                    """
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+            return
+        pilots = [
+            {
+                "c":  row["callsign"],
+                "la": row["latitude"]  or 0,
+                "lo": row["longitude"] or 0,
+                "a":  row["altitude"]  or 0,
+                "s":  row["groundspeed"] or 0,
+                "h":  row["heading"]   or 0,
+                "t":  row["aircraft_type"] or "",
+                "d":  row["departure"] or "",
+                "r":  row["arrival"]   or "",
+            }
+            for row in rows
+        ]
+        self._send_json(HTTPStatus.OK, {"pilots": pilots, "total": len(pilots)})
+
+    def _handle_ivao_events(self, query: str) -> None:
+        import json as _json
+        limit = _parse_limit_from_query(query, default=30, max_limit=100)
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT event_id, title, date_label, time_label, starts_at, ends_at,
+                           airports, description, image, url
+                    FROM ivao_events
+                    ORDER BY starts_at ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+            return
+        events = [
+            {
+                "id":          row["event_id"],
+                "title":       row["title"] or "",
+                "date_label":  row["date_label"] or "",
+                "time_label":  row["time_label"] or "",
+                "starts_at":   row["starts_at"],
+                "ends_at":     row["ends_at"],
+                "airports":    _json.loads(row["airports"] or "[]"),
+                "description": row["description"] or "",
+                "image":       row["image"] or "",
+                "url":         row["url"] or "",
+            }
+            for row in rows
+        ]
+        self._send_json(HTTPStatus.OK, {"events": events, "count": len(events)})
 
     def _handle_vatsim_airports(self, query: str) -> None:
         limit = _parse_limit_from_query(query, default=50, max_limit=200)

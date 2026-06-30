@@ -15,10 +15,17 @@ export interface AirportCoverage {
   fullCoverage: boolean;
 }
 
+export interface RankedController {
+  callsign: string;
+  name:     string;
+  facility: string;
+}
+
 export interface RankedAirport {
   airport: string;
   manned: boolean;
   controller_count: number;
+  controllers: RankedController[];
   has_atis: boolean;
   coverage: AirportCoverage;
   coverage_score: number;
@@ -185,6 +192,7 @@ export interface Booking {
   ends_at_utc: string;
   booking_type: "booking" | "training" | "exam";
   controller_cid: string;
+  controller_name: string | null;
 }
 
 export interface BookingsResponse {

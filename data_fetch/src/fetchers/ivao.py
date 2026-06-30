@@ -57,9 +57,12 @@ def process_ivao_network(conn: sqlite3.Connection, session: requests.Session) ->
         )
         raise
 
-    atcs = ((payload or {}).get("clients") or {}).get("atcs") or []
-    seen_callsigns: list[str] = []
+    clients   = (payload or {}).get("clients") or {}
+    atcs      = clients.get("atcs") or []
+    pilots    = clients.get("pilots") or []
 
+    # ── ATC ──────────────────────────────────────────────────────────────────
+    seen_atc: list[str] = []
     for client in atcs:
         if not isinstance(client, dict):
             continue
@@ -68,30 +71,36 @@ def process_ivao_network(conn: sqlite3.Connection, session: requests.Session) ->
             continue
 
         atc_session = client.get("atcSession") or {}
-        last_track = client.get("lastTrack") or {}
-        atis = client.get("atis") or {}
+        last_track  = client.get("lastTrack") or {}
+        atis        = client.get("atis") or {}
+        user        = client.get("user") or {}
+        first       = (user.get("firstName") or "").strip()
+        last        = (user.get("lastName") or "").strip()
+        name        = f"{first} {last}".strip() or None
 
         conn.execute(
             """
             INSERT INTO ivao_atc_latest (
-                callsign, user_id, rating, frequency, position,
+                callsign, user_id, name, rating, frequency, position,
                 latitude, longitude, atis_revision, logon_time, last_updated
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(callsign)
             DO UPDATE SET
-                user_id = excluded.user_id,
-                rating = excluded.rating,
-                frequency = excluded.frequency,
-                position = excluded.position,
-                latitude = excluded.latitude,
-                longitude = excluded.longitude,
+                user_id       = excluded.user_id,
+                name          = excluded.name,
+                rating        = excluded.rating,
+                frequency     = excluded.frequency,
+                position      = excluded.position,
+                latitude      = excluded.latitude,
+                longitude     = excluded.longitude,
                 atis_revision = excluded.atis_revision,
-                logon_time = excluded.logon_time,
-                last_updated = excluded.last_updated
+                logon_time    = excluded.logon_time,
+                last_updated  = excluded.last_updated
             """,
             (
                 callsign,
                 to_int(client.get("userId")),
+                name,
                 to_int(client.get("rating")),
                 _normalize_frequency(atc_session.get("frequency")),
                 atc_session.get("position"),
@@ -102,17 +111,70 @@ def process_ivao_network(conn: sqlite3.Connection, session: requests.Session) ->
                 update_timestamp,
             ),
         )
-        seen_callsigns.append(callsign)
+        seen_atc.append(callsign)
 
-    # Drop positions that are no longer online so the table is a true snapshot.
-    if seen_callsigns:
-        placeholders = ",".join("?" for _ in seen_callsigns)
-        conn.execute(
-            f"DELETE FROM ivao_atc_latest WHERE callsign NOT IN ({placeholders})",
-            seen_callsigns,
-        )
+    if seen_atc:
+        placeholders = ",".join("?" for _ in seen_atc)
+        conn.execute(f"DELETE FROM ivao_atc_latest WHERE callsign NOT IN ({placeholders})", seen_atc)
     else:
         conn.execute("DELETE FROM ivao_atc_latest")
+
+    # ── Pilots ────────────────────────────────────────────────────────────────
+    seen_pilots: list[str] = []
+    for client in pilots:
+        if not isinstance(client, dict):
+            continue
+        callsign = (client.get("callsign") or "").strip().upper()
+        if not callsign:
+            continue
+
+        last_track = client.get("lastTrack") or {}
+        fp         = client.get("flightPlan") or {}
+        aircraft   = fp.get("aircraft") or {}
+        ac_type    = (aircraft.get("icaoCode") or fp.get("aircraftId") or "").strip().upper()
+        dep        = (fp.get("departureId") or "").strip().upper()
+        arr        = (fp.get("arrivalId") or "").strip().upper()
+
+        conn.execute(
+            """
+            INSERT INTO ivao_pilots_latest (
+                callsign, user_id, latitude, longitude, altitude,
+                groundspeed, heading, aircraft_type, departure, arrival, last_updated
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(callsign)
+            DO UPDATE SET
+                user_id       = excluded.user_id,
+                latitude      = excluded.latitude,
+                longitude     = excluded.longitude,
+                altitude      = excluded.altitude,
+                groundspeed   = excluded.groundspeed,
+                heading       = excluded.heading,
+                aircraft_type = excluded.aircraft_type,
+                departure     = excluded.departure,
+                arrival       = excluded.arrival,
+                last_updated  = excluded.last_updated
+            """,
+            (
+                callsign,
+                to_int(client.get("userId")),
+                to_float(last_track.get("latitude")),
+                to_float(last_track.get("longitude")),
+                to_int(last_track.get("altitude")),
+                to_int(last_track.get("groundSpeed")),
+                to_int(last_track.get("heading")),
+                ac_type or None,
+                dep or None,
+                arr or None,
+                update_timestamp,
+            ),
+        )
+        seen_pilots.append(callsign)
+
+    if seen_pilots:
+        placeholders = ",".join("?" for _ in seen_pilots)
+        conn.execute(f"DELETE FROM ivao_pilots_latest WHERE callsign NOT IN ({placeholders})", seen_pilots)
+    else:
+        conn.execute("DELETE FROM ivao_pilots_latest")
 
     conn.commit()
     update_feed_state(
@@ -122,5 +184,5 @@ def process_ivao_network(conn: sqlite3.Connection, session: requests.Session) ->
         last_update=update_timestamp,
         last_success=update_timestamp,
     )
-    LOGGER.info("%s stored %d online ATC positions", FEED_NAME, len(seen_callsigns))
-    return len(seen_callsigns)
+    LOGGER.info("%s stored %d ATC, %d pilots", FEED_NAME, len(seen_atc), len(seen_pilots))
+    return len(seen_atc)

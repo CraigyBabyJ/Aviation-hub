@@ -45,7 +45,7 @@ function FilterChip({
       className={cn(
         "rounded-full border px-2.5 py-1 text-[9px] font-bold tracking-[0.18em] uppercase transition-colors",
         active
-          ? "border-red-500/40 bg-red-500/10 text-red-200"
+          ? "border-[rgba(var(--accent),0.4)] bg-[rgba(var(--accent),0.1)] text-white"
           : "border-white/[0.06] bg-white/[0.02] text-zinc-500 hover:border-white/[0.14] hover:text-zinc-300"
       )}
     >
@@ -66,7 +66,7 @@ function ServiceBadge({
       className={cn(
         "rounded border px-1.5 py-0.5 text-[9px] font-bold tracking-widest",
         active
-          ? "border-red-500/35 bg-red-500/10 text-red-200"
+          ? "border-[rgba(var(--accent),0.35)] bg-[rgba(var(--accent),0.1)] text-white"
           : "border-white/[0.05] bg-white/[0.02] text-zinc-700"
       )}
     >
@@ -99,6 +99,16 @@ function AirportRow({ airport }: { airport: VatsimAirportListItem }) {
               />
             ))}
           </div>
+          {airport.controllers.length > 0 && (
+            <div className="mt-1.5 flex flex-wrap gap-x-2 gap-y-0.5">
+              {airport.controllers.map((c) => (
+                <span key={c.callsign} className="text-[9px] text-zinc-600">
+                  <span className="text-zinc-500 font-mono">{c.facility_label}</span>
+                  {c.name ? ` ${c.name}` : ""}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className="flex items-center gap-3 flex-shrink-0">
@@ -116,28 +126,63 @@ function AirportRow({ airport }: { airport: VatsimAirportListItem }) {
   );
 }
 
-export function AtcPanel() {
+interface IvaoController { callsign: string; airport: string; facility_label: string; frequency: string; rating_label: string; logon_minutes: number; atis: string }
+interface IvaoControllersResponse { controllers: IvaoController[]; total: number; ts: string }
+
+function IvaoAtcPanel({ loading, error, lastUpdated, refresh, controllers }: {
+  loading: boolean; error: string | null; lastUpdated: Date | null; refresh: () => void;
+  controllers: IvaoController[];
+}) {
+  const FAC_COLOR: Record<string, string> = { CTR:"#ef4444", APP:"#f97316", TWR:"#fbbf24", GND:"#34d399", DEL:"#60a5fa", ATIS:"#a78bfa" };
+  return (
+    <HubPanel delay={0.2} className="flex flex-col h-full" noPadding>
+      <div className="p-5 pb-3 flex items-start justify-between gap-2">
+        <SectionHeader title="ATC Coverage" subtitle="Live IVAO controllers" live count={controllers.length || undefined} className="mb-0" />
+        <LiveStatus loading={loading} error={error} lastUpdated={lastUpdated} onRefresh={refresh} />
+      </div>
+      <div className="px-5 pb-2 text-[10px] text-zinc-600">{controllers.length} controllers online</div>
+      <div className="flex-1 overflow-y-auto px-5 pb-3">
+        {loading && !controllers.length
+          ? Array.from({ length: 6 }).map((_, i) => <div key={i} className="hub-row py-3"><Skeleton className="w-full h-8" /></div>)
+          : controllers.map((c) => {
+            const color = FAC_COLOR[c.facility_label] ?? "#94a3b8";
+            return (
+              <div key={c.callsign} className="hub-row py-2.5 flex items-center gap-2 text-xs">
+                <span className="font-mono font-bold text-white text-[11px] w-28 flex-shrink-0 truncate">{c.callsign}</span>
+                <span className="text-[9px] px-1.5 py-0.5 rounded-full font-bold" style={{ color, background:`${color}18`, border:`1px solid ${color}40` }}>{c.facility_label}</span>
+                <span className="font-mono text-zinc-500 text-[10px]">{c.frequency}</span>
+                <span className="ml-auto text-[9px] text-zinc-600">{c.rating_label}</span>
+              </div>
+            );
+          })}
+        {!loading && !controllers.length && <div className="hub-row py-6 text-center text-[11px] text-zinc-600">No IVAO controllers online.</div>}
+      </div>
+    </HubPanel>
+  );
+}
+
+export function AtcPanel({ network = "vatsim" }: { network?: string }) {
+  const ivao = useHub<IvaoControllersResponse>("ivao-controllers", {}, { interval: 30_000 });
+
   const [filters, setFilters] = useState<Record<FilterKey, boolean>>({
-    hasAnyAtc: false,
-    hasTwr: false,
-    hasGroundOps: false,
-    hasRadar: false,
-    fullCoverage: false,
-    hasAtis: false,
+    hasAnyAtc: false, hasTwr: false, hasGroundOps: false, hasRadar: false, fullCoverage: false, hasAtis: false,
   });
 
   const queryParams: Record<string, string> = { limit: "80", sort: "coverage" };
   for (const filter of FILTER_DEFS) {
-    if (filters[filter.key]) {
-      queryParams[filter.query] = "1";
-    }
+    if (filters[filter.key]) queryParams[filter.query] = "1";
   }
 
   const { data, loading, error, lastUpdated, refresh } = useHub<VatsimAirportsResponse>(
-    "vatsim/airports",
-    queryParams,
-    { interval: 30_000 }
+    "vatsim/airports", queryParams, { interval: 30_000 }
   );
+
+  if (network === "ivao") {
+    return <IvaoAtcPanel
+      loading={ivao.loading} error={ivao.error} lastUpdated={ivao.lastUpdated} refresh={ivao.refresh}
+      controllers={ivao.data?.controllers ?? []}
+    />;
+  }
 
   const airports = data?.airports ?? [];
   const totalControllers = airports.reduce((sum, airport) => sum + airport.controller_count, 0);

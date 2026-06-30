@@ -7,15 +7,17 @@ import { useHub } from "@/lib/hooks/use-hub";
 import type { SigmetsResponse, Sigmet } from "@/lib/api-types";
 import { cn } from "@/lib/utils";
 
-const HAZARD_LABELS: Record<string, { label: string; color: string }> = {
-  TS: { label: "Thunderstorm", color: "text-red-400" },
-  SEV_TURB: { label: "Severe Turbulence", color: "text-zinc-300" },
-  SEV_ICE: { label: "Severe Icing", color: "text-zinc-300" },
-  ICE: { label: "Icing", color: "text-zinc-400" },
-  TURB: { label: "Turbulence", color: "text-zinc-400" },
-  VA: { label: "Volcanic Ash", color: "text-red-300" },
-  TC: { label: "Tropical Cyclone", color: "text-red-400" },
-  RDOACT_CLD: { label: "Radioactive Cloud", color: "text-red-500" },
+// High-severity hazards use accent colour; others use static zinc shades
+const HIGH_SEVERITY = new Set(["TS", "VA", "TC", "RDOACT_CLD"]);
+const HAZARD_LABELS: Record<string, { label: string; color?: string }> = {
+  TS:         { label: "Thunderstorm" },
+  SEV_TURB:   { label: "Severe Turbulence", color: "text-zinc-300" },
+  SEV_ICE:    { label: "Severe Icing",      color: "text-zinc-300" },
+  ICE:        { label: "Icing",             color: "text-zinc-400" },
+  TURB:       { label: "Turbulence",        color: "text-zinc-400" },
+  VA:         { label: "Volcanic Ash" },
+  TC:         { label: "Tropical Cyclone" },
+  RDOACT_CLD: { label: "Radioactive Cloud" },
 };
 
 function formatSigmetTime(iso: string) {
@@ -25,17 +27,20 @@ function formatSigmetTime(iso: string) {
 }
 
 function SigmetChip({ sig }: { sig: Sigmet }) {
-  const hazard = HAZARD_LABELS[sig.hazard] ?? { label: sig.hazard, color: "text-zinc-400" };
-  const isHighSeverity = ["TS", "VA", "TC", "RDOACT_CLD"].includes(sig.hazard);
+  const hazard        = HAZARD_LABELS[sig.hazard] ?? { label: sig.hazard, color: "text-zinc-400" };
+  const isHighSeverity = HIGH_SEVERITY.has(sig.hazard);
 
   return (
     <div className={cn(
       "flex-shrink-0 flex items-center gap-2 px-3 py-1.5 rounded border text-[10px]",
       isHighSeverity
-        ? "border-red-600/30 bg-red-950/20"
+        ? "border-[rgba(var(--accent),0.30)] bg-[rgba(var(--accent),0.08)]"
         : "border-white/[0.06] bg-white/[0.02]"
     )}>
-      <span className={cn("font-bold tracking-wider", hazard.color)}>{sig.hazard}</span>
+      <span
+        className={cn("font-bold tracking-wider", !isHighSeverity && hazard.color)}
+        style={isHighSeverity ? { color: "var(--accent-text)" } : {}}
+      >{sig.hazard}</span>
       <span className="text-zinc-600">·</span>
       <span className="text-zinc-500">{sig.fir}</span>
       <span className="text-zinc-700 text-[9px] tabular-nums hidden sm:block">
@@ -62,13 +67,14 @@ export function SigmetBanner() {
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, y: -8 }}
       transition={{ duration: 0.3 }}
-      className="mb-4 rounded-xl border border-red-600/20 bg-red-950/10 overflow-hidden"
+      className="mb-4 rounded-xl overflow-hidden transition-[border-color,background-color] duration-500"
+      style={{ border: "1px solid rgba(var(--accent),0.20)", backgroundColor: "rgba(var(--accent),0.06)" }}
     >
       {/* Header bar */}
       <div className="flex items-center justify-between gap-3 px-4 py-2.5">
         <div className="flex items-center gap-3">
-          <AlertTriangle size={12} className="text-red-500 flex-shrink-0" />
-          <span className="text-[10px] font-bold tracking-[0.18em] uppercase text-red-400">
+          <AlertTriangle size={12} className="flex-shrink-0 transition-[color] duration-500" style={{ color: "var(--accent-text)" }} />
+          <span className="text-[10px] font-bold tracking-[0.18em] uppercase transition-[color] duration-500" style={{ color: "var(--accent-text)" }}>
             Active SIGMETs
           </span>
           <span className="text-[9px] text-zinc-600 tracking-wider">
@@ -112,7 +118,10 @@ export function SigmetBanner() {
               {sigmets.map((sig) => (
                 <div key={sig.id} className="hub-row py-2">
                   <div className="flex items-start gap-3">
-                    <span className={cn("text-[9px] font-bold w-16 flex-shrink-0 tracking-wider", (HAZARD_LABELS[sig.hazard] ?? HAZARD_LABELS.TS).color)}>
+                    <span
+                      className={cn("text-[9px] font-bold w-16 flex-shrink-0 tracking-wider", !HIGH_SEVERITY.has(sig.hazard) && (HAZARD_LABELS[sig.hazard]?.color ?? "text-zinc-400"))}
+                      style={HIGH_SEVERITY.has(sig.hazard) ? { color: "var(--accent-text)" } : {}}
+                    >
                       {sig.hazard}
                       {sig.qualifier && <span className="text-zinc-700"> {sig.qualifier}</span>}
                     </span>

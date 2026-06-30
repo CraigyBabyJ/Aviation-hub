@@ -32,20 +32,17 @@ export function Navbar() {
           {/* Logo */}
           <Link href="/dashboard" className="flex items-center gap-3 group">
             <div className="relative flex items-center justify-center w-7 h-7">
-              {/* Outer ring */}
-              <div className="absolute inset-0 rounded-full border border-red-600/60 group-hover:border-red-500/80 transition-colors" />
-              {/* Inner dot */}
-              <div className="w-2 h-2 rounded-full bg-red-600 group-hover:bg-red-500 transition-colors" />
-              {/* Pulse */}
-              <div className="absolute inset-0 rounded-full border border-red-600/30 animate-ping" style={{ animationDuration: "3s" }} />
+              <div className="absolute inset-0 rounded-full border transition-[border-color] duration-500"
+                style={{ borderColor: "rgba(var(--accent), 0.6)" }} />
+              <div className="w-2 h-2 rounded-full transition-[background-color] duration-500"
+                style={{ backgroundColor: "var(--accent-hex)" }} />
+              <div className="absolute inset-0 rounded-full border animate-ping"
+                style={{ borderColor: "rgba(var(--accent), 0.3)", animationDuration: "3s" }} />
             </div>
             <div className="flex flex-col leading-none">
-              <span className="text-white font-bold text-sm tracking-[0.2em] uppercase">
-                Aviation
-              </span>
-              <span className="text-red-500/80 text-[10px] tracking-[0.35em] uppercase font-medium">
-                Hub
-              </span>
+              <span className="text-white font-bold text-sm tracking-[0.2em] uppercase">Aviation</span>
+              <span className="text-[10px] tracking-[0.35em] uppercase font-medium transition-[color] duration-500"
+                style={{ color: "var(--accent-text)" }}>Hub</span>
             </div>
           </Link>
 
@@ -69,7 +66,8 @@ export function Navbar() {
                   {active && (
                     <motion.div
                       layoutId="nav-indicator"
-                      className="absolute bottom-0 left-2 right-2 h-px bg-red-500"
+                      className="absolute bottom-0 left-2 right-2 h-px transition-[background-color] duration-500"
+                      style={{ backgroundColor: "var(--accent-hex)" }}
                       transition={{ type: "spring", stiffness: 380, damping: 30 }}
                     />
                   )}
@@ -84,7 +82,8 @@ export function Navbar() {
 
             {/* Live indicator */}
             <div className="hidden sm:flex items-center gap-2">
-              <span className="live-dot w-1.5 h-1.5 rounded-full bg-red-500 block" />
+              <span className="live-dot w-1.5 h-1.5 rounded-full block transition-[background-color] duration-500"
+                style={{ backgroundColor: "var(--accent-hex)" }} />
               <span className="text-[10px] tracking-widest uppercase text-zinc-600">Live</span>
             </div>
 
@@ -97,7 +96,8 @@ export function Navbar() {
       </div>
 
       {/* Bottom glow line */}
-      <div className="h-px bg-gradient-to-r from-transparent via-red-600/20 to-transparent" />
+      <div className="h-px transition-[background] duration-500"
+        style={{ background: "linear-gradient(to right, transparent, rgba(var(--accent), 0.25), transparent)" }} />
     </motion.header>
   );
 }

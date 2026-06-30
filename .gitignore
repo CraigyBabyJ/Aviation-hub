@@ -12,3 +12,10 @@ __pycache__/
 # Local Discord secrets
 discord_bot/.env
 discord_bot/.venv/
+discord_bot/.full_ground_tower_alerts.json
+
+# IVAO OAuth tokens and other secrets — never commit
+secrets/
+
+# Generated data directory
+data/

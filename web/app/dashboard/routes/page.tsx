@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 
+import { useNetwork } from "@/lib/network-context";
 import { HubPanel } from "@/components/ui/hub-panel";
 import { LiveStatus, Skeleton } from "@/components/ui/live-status";
 import { SectionHeader } from "@/components/ui/section-header";
@@ -56,38 +57,34 @@ function CoverageBadges({ coverage }: { coverage: AirportCoverage }) {
 function RouteCard({ route }: { route: SuggestedRoute }) {
   return (
     <div className="hub-row p-4">
-      <div className="flex items-start justify-between gap-4 mb-3">
-        <div className="flex items-center gap-3 min-w-0">
-          <div>
-            <p className="text-[10px] uppercase tracking-[0.22em] text-zinc-600 mb-1">Departure</p>
-            <p className="text-lg font-bold tracking-[0.16em] text-white">{route.departure.icao}</p>
-            <p className="text-[11px] text-zinc-500 truncate">{route.departure.name || route.departure.country || "Live airport"}</p>
-          </div>
-          <div className="text-zinc-700 text-lg">→</div>
-          <div>
-            <p className="text-[10px] uppercase tracking-[0.22em] text-zinc-600 mb-1">Arrival</p>
-            <p className="text-lg font-bold tracking-[0.16em] text-white">{route.arrival.icao}</p>
-            <p className="text-[11px] text-zinc-500 truncate">{route.arrival.name || route.arrival.country || "Live airport"}</p>
-          </div>
+      {/* Flight time / distance — top right */}
+      <div className="flex items-start justify-between gap-4 mb-4">
+        <div className="flex items-center gap-2 text-zinc-700 text-sm tracking-widest uppercase">
+          <span className="text-[10px]">Route</span>
         </div>
-
         <div className="text-right flex-shrink-0">
           <p className="text-xl font-bold text-white tabular-nums">{minutesLabel(route.estimated_minutes)}</p>
           <p className="text-[10px] text-zinc-600">{route.distance_nm} nm</p>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+      {/* Two columns — each with airport name above its live services */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {/* Departure */}
         <div>
-          <p className="text-[10px] uppercase tracking-[0.18em] text-zinc-700 mb-1">
-            {route.departure.icao} live services
-          </p>
+          <p className="text-[10px] uppercase tracking-[0.22em] text-zinc-600 mb-1">Departure</p>
+          <p className="text-lg font-bold tracking-[0.16em] text-white mb-0.5">{route.departure.icao}</p>
+          <p className="text-[11px] text-zinc-500 truncate mb-3">{route.departure.name || route.departure.country || "Live airport"}</p>
+          <p className="text-[10px] uppercase tracking-[0.18em] text-zinc-700 mb-1">{route.departure.icao} live services</p>
           <CoverageBadges coverage={route.departure.coverage} />
         </div>
-        <div>
-          <p className="text-[10px] uppercase tracking-[0.18em] text-zinc-700 mb-1">
-            {route.arrival.icao} live services
-          </p>
+
+        {/* Arrival */}
+        <div className="md:border-l md:border-white/[0.05] md:pl-4">
+          <p className="text-[10px] uppercase tracking-[0.22em] text-zinc-600 mb-1">Arrival</p>
+          <p className="text-lg font-bold tracking-[0.16em] text-white mb-0.5">{route.arrival.icao}</p>
+          <p className="text-[11px] text-zinc-500 truncate mb-3">{route.arrival.name || route.arrival.country || "Live airport"}</p>
+          <p className="text-[10px] uppercase tracking-[0.18em] text-zinc-700 mb-1">{route.arrival.icao} live services</p>
           <CoverageBadges coverage={route.arrival.coverage} />
         </div>
       </div>
@@ -96,6 +93,7 @@ function RouteCard({ route }: { route: SuggestedRoute }) {
 }
 
 export default function RoutesPage() {
+  const { network } = useNetwork();
   const [region, setRegion] = useState<(typeof REGIONS)[number]["key"]>("uk");
   const [minutes, setMinutes] = useState(90);
 
@@ -111,6 +109,15 @@ export default function RoutesPage() {
   );
 
   const routes = data?.routes ?? [];
+
+  if (network === "ivao") return (
+    <div className="max-w-[1200px] mx-auto px-4 sm:px-6 py-6">
+      <HubPanel cornerAccent className="flex flex-col items-center justify-center py-20 gap-4">
+        <p className="text-zinc-500 text-sm">Routes are sourced from VATSIM data and are not available for IVAO.</p>
+        <p className="text-zinc-600 text-xs">Switch back to VATSIM to browse suggested routes.</p>
+      </HubPanel>
+    </div>
+  );
 
   return (
     <div className="max-w-[1200px] mx-auto px-4 sm:px-6 py-6">
