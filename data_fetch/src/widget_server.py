@@ -2529,6 +2529,9 @@ class WidgetHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/ivao/member":
                 self._handle_ivao_member(parsed.query)
                 return
+            if parsed.path == "/api/ivao/airports":
+                self._handle_ivao_airports(parsed.query)
+                return
             if parsed.path == AIRPORTS_UPCOMING_PATH:
                 self._handle_airports_upcoming(parsed.query)
                 return
@@ -3140,6 +3143,103 @@ class WidgetHandler(BaseHTTPRequestHandler):
             "pilot_rating": (rating.get("pilotRating") or {}).get("shortName") or "—",
             "pilot_minutes": hours_by_type.get("pilot", 0),
             "atc_minutes":   hours_by_type.get("atc", 0),
+        })
+
+    def _handle_ivao_airports(self, query: str) -> None:
+        params = urllib.parse.parse_qs(query)
+        limit        = _parse_limit_from_query(query, default=200, max_limit=500)
+        sort         = _parse_sort_query(query, "sort", default="icao", allowed={"icao", "coverage"})
+        want_gnd     = params.get("has_gnd", [""])[0] in ("1", "true")
+        want_twr     = params.get("has_twr", [""])[0] in ("1", "true")
+
+        IVAO_RATING_LABELS: dict[int, str] = {
+            1: "AS1", 2: "AS2", 3: "AS3", 4: "ADC",
+            5: "APC", 6: "ACC", 7: "SEC", 8: "SAI", 9: "CAI",
+        }
+
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT callsign, user_id, name, rating, frequency, position, logon_time FROM ivao_atc_latest"
+                ).fetchall()
+                # Build airport → station info lookup
+                ref_rows = conn.execute(
+                    "SELECT icao, name, country FROM airport_reference_latest WHERE length(icao) = 4"
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+            return
+
+        ref: dict[str, dict[str, str]] = {r["icao"]: {"name": r["name"] or "", "country": r["country"] or ""} for r in ref_rows}
+
+        # Group controllers by airport prefix
+        airport_map: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            cs = row["callsign"] or ""
+            airport_icao = cs.split("_")[0].upper() if "_" in cs else cs.upper()
+            if not airport_icao:
+                continue
+            airport_map.setdefault(airport_icao, []).append({
+                "callsign":   cs,
+                "user_id":    row["user_id"],
+                "name":       row["name"] or "",
+                "rating":     IVAO_RATING_LABELS.get(row["rating"] or 0, "—"),
+                "facility":   row["position"] or "",
+                "facility_label": row["position"] or "",
+                "frequency":  row["frequency"] or "",
+                "logon_time": row["logon_time"] or "",
+            })
+
+        # Build coverage + optional filters
+        _POS_GND = {"GND"}
+        _POS_TWR = {"TWR"}
+        _POS_DEL = {"DEL"}
+        _POS_APP = {"APP", "DEP"}
+        _POS_CTR = {"CTR", "FSS"}
+
+        airports: list[dict[str, Any]] = []
+        for icao, controllers in airport_map.items():
+            positions = {c["facility"].upper() for c in controllers}
+            coverage = {
+                "hasDel":        bool(positions & _POS_DEL),
+                "hasGnd":        bool(positions & _POS_GND),
+                "hasTwr":        bool(positions & _POS_TWR),
+                "hasApp":        bool(positions & _POS_APP),
+                "hasCtr":        bool(positions & _POS_CTR),
+                "hasAnyAtc":     bool(controllers),
+                "hasGroundOps":  bool(positions & (_POS_DEL | _POS_GND)),
+                "fullCoverage":  bool(positions & _POS_GND and positions & _POS_TWR and positions & _POS_APP),
+            }
+            if want_gnd and not coverage["hasGnd"]:
+                continue
+            if want_twr and not coverage["hasTwr"]:
+                continue
+            station = ref.get(icao, {})
+            airports.append({
+                "icao":             icao,
+                "name":             station.get("name", ""),
+                "country":          station.get("country", ""),
+                "controller_count": len(controllers),
+                "controllers":      controllers,
+                "coverage":         coverage,
+                "coverage_score":   sum(1 for v in coverage.values() if v),
+            })
+
+        if sort == "icao":
+            airports.sort(key=lambda a: a["icao"])
+        else:
+            airports.sort(key=lambda a: (-a["coverage_score"], a["icao"]))
+
+        airports = airports[:limit]
+        now = datetime.now(timezone.utc).isoformat()
+        self._send_json(HTTPStatus.OK, {
+            "generated_at": now,
+            "source":       "ivao",
+            "sort":         sort,
+            "limit":        limit,
+            "filters":      {"hasGnd": want_gnd, "hasTwr": want_twr},
+            "count":        len(airports),
+            "airports":     airports,
         })
 
     def _handle_vatsim_airports(self, query: str) -> None:

@@ -114,7 +114,7 @@ const COMMAND_GROUPS: CommandGroup[] = [
   {
     label: "Bot & Server",
     commands: [
-      { name: "/gnd-twr-alerts", description: "Enable/disable GND + TWR online alerts for this server" },
+      { name: "/gnd-twr-alerts", description: "Enable/disable GND + TWR online alerts for this server (VATSIM and/or IVAO)" },
       { name: "/help", description: "Show every slash command and its description" },
       { name: "/info", description: "About Aviation Hub — bot invite & support server links" },
       { name: "/ping", description: "Check gateway latency to the Discord server" },

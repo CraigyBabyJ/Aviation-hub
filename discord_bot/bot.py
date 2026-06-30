@@ -425,6 +425,10 @@ class AviationHubBot(commands.Bot):
             seconds=_full_gnd_twr_alert_poll_seconds()
         )
         self.full_gnd_twr_alert_loop.start()
+        self.ivao_gnd_twr_alert_loop.change_interval(
+            seconds=_full_gnd_twr_alert_poll_seconds()
+        )
+        self.ivao_gnd_twr_alert_loop.start()
         LOG.info(
             "Full GND + TWR alert worker ready; polling every %ss when servers opt in.",
             _full_gnd_twr_alert_poll_seconds(),
@@ -531,6 +535,13 @@ class AviationHubBot(commands.Bot):
             if cfg.get("enabled") and str(cfg.get("channel_id") or "").isdigit()
         }
 
+    def _ivao_gnd_twr_enabled_configs(self) -> dict[str, dict[str, Any]]:
+        return {
+            guild_id: cfg
+            for guild_id, cfg in self._full_gnd_twr_config.items()
+            if cfg.get("ivao_enabled") and str(cfg.get("ivao_channel_id") or "").isdigit()
+        }
+
     def set_full_gnd_twr_alerts(
         self,
         *,
@@ -551,6 +562,29 @@ class AviationHubBot(commands.Bot):
             cfg["initialized"] = False
             cfg["alerted_airports"] = []
         cfg.setdefault("alerted_airports", [])
+        self._save_full_gnd_twr_alert_state()
+        return cfg
+
+    def set_ivao_gnd_twr_alerts(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        enabled: bool,
+    ) -> dict[str, Any]:
+        if not self._full_gnd_twr_state_loaded:
+            self._load_full_gnd_twr_alert_state()
+        guild_key = str(guild_id)
+        cfg = self._full_gnd_twr_config.setdefault(
+            guild_key,
+            {"enabled": False, "channel_id": "", "initialized": False, "alerted_airports": []},
+        )
+        cfg["ivao_enabled"] = enabled
+        cfg["ivao_channel_id"] = str(channel_id)
+        if enabled:
+            cfg["ivao_initialized"] = False
+            cfg["ivao_alerted_airports"] = []
+        cfg.setdefault("ivao_alerted_airports", [])
         self._save_full_gnd_twr_alert_state()
         return cfg
 
@@ -682,9 +716,102 @@ class AviationHubBot(commands.Bot):
     async def full_gnd_twr_alert_loop_error(self, error: Exception) -> None:
         LOG.exception("Full GND + TWR alert loop failed: %s", error)
 
+    async def _send_ivao_gnd_twr_alert(self, channel_id: int, airport: dict[str, Any]) -> None:
+        channel = await self._full_gnd_twr_alert_channel(channel_id)
+        if channel is None:
+            return
+        icao = str(airport.get("icao") or "?").upper()
+        name = airport.get("name") or "Airport"
+        country = airport.get("country") or "—"
+        controllers = airport.get("controllers") or []
+        controller_lines = []
+        for c in controllers[:8]:
+            callsign = c.get("callsign") or "?"
+            facility = c.get("facility_label") or c.get("facility") or "ATC"
+            name_or_vid = c.get("name") or f"VID {c.get('user_id') or '?'}"
+            controller_lines.append(f"• `{callsign}` {facility} · {name_or_vid}")
+        if len(controllers) > 8:
+            controller_lines.append(f"… +{len(controllers) - 8} more")
+        message = "\n".join([
+            f"**{icao} now has GND + TWR online**",
+            f"**{name}** · {country}",
+            "",
+            f"**IVAO controllers ({airport.get('controller_count', len(controllers))})**",
+            "\n".join(controller_lines) or "No controller details returned.",
+            "",
+            "Aviation Hub live IVAO coverage alert",
+        ])
+        await channel.send(content=_truncate(message, 2000))
+
+    @tasks.loop(seconds=60)
+    async def ivao_gnd_twr_alert_loop(self) -> None:
+        await self.wait_until_ready()
+        session = self.http_session
+        if session is None:
+            return
+        enabled_configs = self._ivao_gnd_twr_enabled_configs()
+        if not enabled_configs:
+            return
+        status, data = await _hub_get(
+            session,
+            "/api/ivao/airports",
+            limit=200,
+            has_gnd=1,
+            has_twr=1,
+            sort="icao",
+        )
+        if status != 200:
+            LOG.warning("IVAO GND + TWR alert poll failed: status=%s", status)
+            return
+        airports = data.get("airports") if isinstance(data, dict) else []
+        if not isinstance(airports, list):
+            return
+
+        online = {
+            str(a.get("icao") or "").strip().upper()
+            for a in airports
+            if isinstance(a, dict) and len(str(a.get("icao") or "").strip()) == 4
+            and _airport_controller_count(a) >= FULL_GND_TWR_ALERT_MIN_CONTROLLERS
+        }
+        airport_by_icao = {
+            str(a.get("icao") or "").strip().upper(): a
+            for a in airports
+            if isinstance(a, dict) and _airport_controller_count(a) >= FULL_GND_TWR_ALERT_MIN_CONTROLLERS
+        }
+        if not self._full_gnd_twr_state_loaded:
+            self._load_full_gnd_twr_alert_state()
+
+        for guild_id, cfg in enabled_configs.items():
+            alerted = {
+                str(icao).strip().upper()
+                for icao in (cfg.get("ivao_alerted_airports") or [])
+                if len(str(icao).strip()) == 4
+            }
+            channel_id = int(cfg["ivao_channel_id"])
+            if not cfg.get("ivao_initialized"):
+                cfg["ivao_initialized"] = True
+                cfg["ivao_alerted_airports"] = sorted(online)
+                continue
+            for icao in sorted(online - alerted):
+                airport = airport_by_icao.get(icao)
+                if not airport:
+                    continue
+                try:
+                    await self._send_ivao_gnd_twr_alert(channel_id, airport)
+                except discord.HTTPException as exc:
+                    LOG.warning("Could not send IVAO GND + TWR alert for guild %s: %s", guild_id, exc)
+            cfg["ivao_alerted_airports"] = sorted(online)
+        self._save_full_gnd_twr_alert_state()
+
+    @ivao_gnd_twr_alert_loop.error
+    async def ivao_gnd_twr_alert_loop_error(self, error: Exception) -> None:
+        LOG.exception("IVAO GND + TWR alert loop failed: %s", error)
+
     async def close(self) -> None:
         if self.full_gnd_twr_alert_loop.is_running():
             self.full_gnd_twr_alert_loop.cancel()
+        if self.ivao_gnd_twr_alert_loop.is_running():
+            self.ivao_gnd_twr_alert_loop.cancel()
         if self.http_session:
             await self.http_session.close()
         await super().close()
@@ -2439,7 +2566,8 @@ async def cmd_help(interaction: discord.Interaction) -> None:
         name="Server alerts",
         value=(
             "Use **`/gnd-twr-alerts enabled:true`** in the channel where alerts should post. "
-            "Use **`/gnd-twr-alerts enabled:false`** to turn them off. "
+            "Add **`network:ivao`** for IVAO alerts (separate from VATSIM). "
+            "Use **`/gnd-twr-alerts enabled:false`** to turn off. "
             "Requires **Manage Server**."
         ),
         inline=False,
@@ -2502,15 +2630,21 @@ async def cmd_ping(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(
     name="gnd-twr-alerts",
-    description="Enable or disable GND + TWR online alerts for this server",
+    description="Enable or disable GND + TWR online alerts for this server (VATSIM and/or IVAO)",
 )
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.describe(
     enabled="Turn alerts on or off for this Discord server",
+    network="Which network to configure (default: vatsim)",
 )
+@app_commands.choices(network=[
+    app_commands.Choice(name="VATSIM", value="vatsim"),
+    app_commands.Choice(name="IVAO",   value="ivao"),
+])
 async def cmd_gnd_twr_alerts(
     interaction: discord.Interaction,
     enabled: bool,
+    network: str = "vatsim",
 ) -> None:
     if interaction.guild is None:
         await interaction.response.send_message(
@@ -2535,21 +2669,39 @@ async def cmd_gnd_twr_alerts(
             )
             return
 
-    cfg = bot.set_full_gnd_twr_alerts(
-        guild_id=interaction.guild.id,
-        channel_id=int(target.id),
-        enabled=enabled,
-    )
-    if enabled:
-        await interaction.response.send_message(
-            f"GND + TWR alerts are now **on** for this server in <#{cfg['channel_id']}>.",
-            ephemeral=True,
+    net = network.lower()
+    if net == "ivao":
+        cfg = bot.set_ivao_gnd_twr_alerts(
+            guild_id=interaction.guild.id,
+            channel_id=int(target.id),
+            enabled=enabled,
         )
+        if enabled:
+            await interaction.response.send_message(
+                f"IVAO GND + TWR alerts are now **on** for this server in <#{cfg['ivao_channel_id']}>.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "IVAO GND + TWR alerts are now **off** for this server.",
+                ephemeral=True,
+            )
     else:
-        await interaction.response.send_message(
-            "GND + TWR alerts are now **off** for this server.",
-            ephemeral=True,
+        cfg = bot.set_full_gnd_twr_alerts(
+            guild_id=interaction.guild.id,
+            channel_id=int(target.id),
+            enabled=enabled,
         )
+        if enabled:
+            await interaction.response.send_message(
+                f"VATSIM GND + TWR alerts are now **on** for this server in <#{cfg['channel_id']}>.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "VATSIM GND + TWR alerts are now **off** for this server.",
+                ephemeral=True,
+            )
 
 
 # ── SimBrief helpers ──────────────────────────────────────────────────────────
