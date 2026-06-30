@@ -2523,6 +2523,12 @@ class WidgetHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/ivao/bookings":
                 self._handle_ivao_bookings(parsed.query)
                 return
+            if parsed.path == "/api/ivao/lookup":
+                self._handle_ivao_lookup(parsed.query)
+                return
+            if parsed.path == "/api/ivao/member":
+                self._handle_ivao_member(parsed.query)
+                return
             if parsed.path == AIRPORTS_UPCOMING_PATH:
                 self._handle_airports_upcoming(parsed.query)
                 return
@@ -2964,6 +2970,177 @@ class WidgetHandler(BaseHTTPRequestHandler):
             for row in rows
         ]
         self._send_json(HTTPStatus.OK, {"bookings": bookings, "count": len(bookings)})
+
+    def _handle_ivao_lookup(self, query: str) -> None:
+        params = urllib.parse.parse_qs(query)
+        raw = (params.get("q", [""])[0] or "").strip().upper()
+        if not raw or len(raw) > 20:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "q must be 1–20 characters"})
+            return
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                # ATC callsign (has underscore)
+                if "_" in raw:
+                    row = conn.execute(
+                        "SELECT callsign, user_id, name, rating, frequency, position, logon_time FROM ivao_atc_latest WHERE callsign = ?",
+                        (raw,),
+                    ).fetchone()
+                    if row:
+                        airport = raw.split("_")[0]
+                        self._send_json(HTTPStatus.OK, {
+                            "kind": "atc",
+                            "atc": {
+                                "callsign":   row["callsign"],
+                                "user_id":    row["user_id"],
+                                "name":       row["name"] or "",
+                                "rating":     row["rating"],
+                                "frequency":  row["frequency"] or "",
+                                "position":   row["position"] or "",
+                                "airport":    airport,
+                                "logon_time": row["logon_time"] or "",
+                            },
+                        })
+                        return
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": f"No IVAO ATC online with callsign {raw}"})
+                    return
+
+                # Airport ICAO (3–4 letters, no digits)
+                if 3 <= len(raw) <= 4 and raw.isalpha():
+                    rows = conn.execute(
+                        "SELECT callsign, user_id, name, rating, frequency, position, logon_time FROM ivao_atc_latest WHERE callsign LIKE ? ORDER BY callsign",
+                        (f"{raw}_%",),
+                    ).fetchall()
+                    if rows:
+                        controllers = [
+                            {
+                                "callsign":   r["callsign"],
+                                "user_id":    r["user_id"],
+                                "name":       r["name"] or "",
+                                "rating":     r["rating"],
+                                "frequency":  r["frequency"] or "",
+                                "position":   r["position"] or "",
+                                "logon_time": r["logon_time"] or "",
+                            }
+                            for r in rows
+                        ]
+                        self._send_json(HTTPStatus.OK, {
+                            "kind":              "airport",
+                            "icao":              raw,
+                            "controller_count":  len(controllers),
+                            "controllers":       controllers,
+                        })
+                        return
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": f"No IVAO controllers online at {raw}"})
+                    return
+
+                # Pilot callsign
+                row = conn.execute(
+                    "SELECT callsign, user_id, aircraft_type, departure, arrival, altitude, groundspeed, heading FROM ivao_pilots_latest WHERE callsign = ?",
+                    (raw,),
+                ).fetchone()
+                if row:
+                    self._send_json(HTTPStatus.OK, {
+                        "kind": "pilot",
+                        "pilot": {
+                            "callsign":     row["callsign"],
+                            "user_id":      row["user_id"],
+                            "aircraft":     row["aircraft_type"] or "",
+                            "departure":    row["departure"] or "",
+                            "arrival":      row["arrival"] or "",
+                            "altitude":     row["altitude"] or 0,
+                            "groundspeed":  row["groundspeed"] or 0,
+                            "heading":      row["heading"] or 0,
+                        },
+                    })
+                    return
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"No IVAO pilot online with callsign {raw}"})
+        except sqlite3.OperationalError as exc:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+
+    def _handle_ivao_member(self, query: str) -> None:
+        """Fetch IVAO user profile + hours via the IVAO API using stored OAuth token."""
+        params = urllib.parse.parse_qs(query)
+        vid = (params.get("vid", [""])[0] or "").strip()
+        if not vid or not vid.isdigit():
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "vid must be numeric"})
+            return
+
+        token_file = os.environ.get(
+            "IVAO_TOKEN_FILE",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../secrets/ivao_tokens.json"),
+        )
+        # Get or refresh access token
+        access_token = ""
+        try:
+            with open(token_file, encoding="utf-8") as f:
+                store = json.load(f)
+            expires_at = float(store.get("expires_at", 0))
+            if store.get("access_token") and expires_at > time.time() * 1000 + 60_000:
+                access_token = store["access_token"]
+            else:
+                # Refresh
+                data = urlencode({
+                    "grant_type":    "refresh_token",
+                    "refresh_token": store.get("refresh_token", ""),
+                    "client_id":     "c69d816a-4157-4fdc-92bc-3eefed92937f",
+                }).encode()
+                req = urllib.request.Request(
+                    "https://api.ivao.aero/v2/oauth/token",
+                    data=data, method="POST",
+                    headers={"User-Agent": "AviationHub/1.0", "Content-Type": "application/x-www-form-urlencoded"},
+                )
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    new = json.loads(r.read())
+                new_store = {
+                    "access_token":  new["access_token"],
+                    "refresh_token": new.get("refresh_token", store.get("refresh_token", "")),
+                    "expires_at":    time.time() * 1000 + new.get("expires_in", 3600) * 1000,
+                }
+                with open(token_file, "w", encoding="utf-8") as f:
+                    json.dump(new_store, f, indent=2)
+                access_token = new_store["access_token"]
+        except Exception as exc:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": f"Token error: {exc}"})
+            return
+
+        try:
+            req = urllib.request.Request(
+                f"https://api.ivao.aero/v2/users/{vid}",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "User-Agent": "AviationHub/1.0",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                profile: dict[str, Any] = json.loads(r.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"VID {vid} not found on IVAO"})
+            else:
+                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": f"IVAO API returned {exc.code}"})
+            return
+        except Exception as exc:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+            return
+
+        rating = profile.get("rating") or {}
+        hours_list: list[dict[str, Any]] = profile.get("hours") or []
+        hours_by_type = {h["type"]: h["hours"] for h in hours_list}
+
+        self._send_json(HTTPStatus.OK, {
+            "vid":         profile.get("id"),
+            "first_name":  profile.get("firstName") or "",
+            "last_name":   profile.get("lastName") or "",
+            "country":     profile.get("countryId") or "",
+            "division":    profile.get("divisionId") or "",
+            "center":      profile.get("centerId") or "",
+            "created_at":  profile.get("createdAt") or "",
+            "is_staff":    profile.get("isStaff") or False,
+            "atc_rating":  (rating.get("atcRating") or {}).get("shortName") or "—",
+            "pilot_rating": (rating.get("pilotRating") or {}).get("shortName") or "—",
+            "pilot_minutes": hours_by_type.get("pilot", 0),
+            "atc_minutes":   hours_by_type.get("atc", 0),
+        })
 
     def _handle_vatsim_airports(self, query: str) -> None:
         limit = _parse_limit_from_query(query, default=50, max_limit=200)

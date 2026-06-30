@@ -2018,6 +2018,163 @@ async def cmd_sat(interaction: discord.Interaction, icao: str) -> None:
     )
 
 
+@bot.tree.command(
+    name="ivaolookup",
+    description="IVAO: look up a pilot callsign, ATC callsign, or airport ICAO in the live snapshot",
+)
+@app_commands.describe(query="Pilot callsign (e.g. BAW123), ATC callsign (e.g. EGLL_TWR), or 3–4 letter airport ICAO")
+async def cmd_ivaolookup(interaction: discord.Interaction, query: str) -> None:
+    session = bot.http_session
+    assert session is not None
+    raw = query.strip().upper()
+    if len(raw) < 2 or len(raw) > 20:
+        await interaction.response.send_message("Query must be 2–20 characters.", ephemeral=True)
+        return
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+    if not set(raw) <= allowed:
+        await interaction.response.send_message(
+            "Only letters, digits, and underscore (e.g. BAW123 or EGLL_TWR).", ephemeral=True
+        )
+        return
+    await interaction.response.defer(thinking=True)
+    status, data = await _hub_get(session, "/api/ivao/lookup", q=raw)
+    if status == 404:
+        await interaction.followup.send(
+            f"No IVAO pilot, controller, or airport match for **`{raw}`** in the hub snapshot.",
+            ephemeral=True,
+        )
+        return
+    if status != 200:
+        await interaction.followup.send(f"Hub returned **{status}**.", ephemeral=True)
+        return
+
+    kind = data.get("kind")
+
+    if kind == "pilot":
+        p = data.get("pilot") or {}
+        dep = p.get("departure") or "—"
+        arr = p.get("arrival") or "—"
+        ac  = p.get("aircraft") or "—"
+        alt = p.get("altitude") or 0
+        gs  = p.get("groundspeed") or 0
+        hdg = p.get("heading") or 0
+        vid = p.get("user_id") or "—"
+        lines = [
+            f"**VID:** {vid}",
+            f"**Route:** {dep} → {arr}",
+            f"**Aircraft:** {ac}",
+            f"**Position:** {alt:,} ft · {gs} kt · hdg {hdg}°",
+        ]
+        embed = discord.Embed(
+            title=f"IVAO pilot — `{p.get('callsign')}`",
+            description=_truncate("\n".join(lines), 3900),
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(text="Live IVAO snapshot · Aviation Hub DB (updated every 60 s)")
+        await interaction.followup.send(embed=embed)
+        return
+
+    if kind == "atc":
+        c = data.get("atc") or {}
+        online_since = _format_online_since(c.get("logon_time"))
+        lines = [
+            f"**{c.get('name') or '—'}** · VID {c.get('user_id') or '—'}",
+            f"**{c.get('position') or '—'}** · {c.get('frequency') or '—'} MHz",
+            f"**Airport:** {c.get('airport') or '—'}",
+            f"**Online since:** {online_since}",
+        ]
+        embed = discord.Embed(
+            title=f"IVAO ATC — `{c.get('callsign')}`",
+            description=_truncate("\n".join(lines), 3900),
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(text="Live IVAO snapshot · Aviation Hub DB (updated every 60 s)")
+        await interaction.followup.send(embed=embed)
+        return
+
+    if kind == "airport":
+        icao  = data.get("icao") or raw
+        ctrls = data.get("controllers") or []
+        lines = [f"**{len(ctrls)}** controller(s) online at **{icao}**:"]
+        for c in ctrls[:15]:
+            name = c.get("name") or ""
+            name_part = f" — {name}" if name else ""
+            lines.append(f"• `{c.get('callsign')}` {c.get('position') or ''} {c.get('frequency') or ''}{name_part}")
+        if len(ctrls) > 15:
+            lines.append(f"… and {len(ctrls) - 15} more")
+        embed = discord.Embed(
+            title=f"IVAO airport — {icao}",
+            description=_truncate("\n".join(lines), 3900),
+            color=discord.Color.blue(),
+        )
+        await interaction.followup.send(embed=embed)
+        return
+
+    await interaction.followup.send(f"Unexpected response: `{kind}`", ephemeral=True)
+
+
+@bot.tree.command(
+    name="ivaostats",
+    description="IVAO member profile: rating, pilot & ATC hours",
+)
+@app_commands.describe(vid="IVAO VID (numeric member ID, e.g. 684077)")
+async def cmd_ivaostats(interaction: discord.Interaction, vid: str) -> None:
+    session = bot.http_session
+    assert session is not None
+    vid_clean = vid.strip()
+    if not vid_clean.isdigit():
+        await interaction.response.send_message("VID must be a numeric IVAO member ID.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)
+    status, data = await _hub_get(session, "/api/ivao/member", vid=vid_clean)
+    if status == 404:
+        await interaction.followup.send(f"VID **{vid_clean}** not found on IVAO.", ephemeral=True)
+        return
+    if status != 200:
+        await interaction.followup.send(
+            f"Hub returned **{status}**: `{data.get('error', data)}`", ephemeral=True
+        )
+        return
+
+    name     = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip() or "—"
+    country  = data.get("country") or "—"
+    division = data.get("division") or "—"
+    center   = data.get("center") or "—"
+    atc_rat  = data.get("atc_rating") or "—"
+    pil_rat  = data.get("pilot_rating") or "—"
+    pilot_h  = (data.get("pilot_minutes") or 0) / 60
+    atc_h    = (data.get("atc_minutes") or 0) / 60
+    created  = data.get("created_at") or ""
+    reg_str  = ""
+    if created:
+        try:
+            reg_str = datetime.fromisoformat(created.replace("Z", "+00:00")).strftime("%d %b %Y")
+        except ValueError:
+            reg_str = created[:10]
+
+    lines = [
+        f"**VID:** {vid_clean}",
+        f"**Name:** {name}",
+        f"**ATC Rating:** {atc_rat}",
+        f"**Pilot Rating:** {pil_rat}",
+        f"**Pilot hours:** {pilot_h:.1f} h",
+        f"**ATC hours:** {atc_h:.1f} h",
+        f"**Country / Division / Center:** {country} / {division} / {center}",
+    ]
+    if reg_str:
+        lines.append(f"**Member since:** {reg_str}")
+    if data.get("is_staff"):
+        lines.append("**Staff member** ✓")
+
+    embed = discord.Embed(
+        title=f"IVAO member — VID {vid_clean}",
+        description="\n".join(lines),
+        color=discord.Color.blue(),
+    )
+    embed.set_footer(text="Data: api.ivao.aero · hours in flight-minutes converted to hours")
+    await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="ivaobookings", description="Scheduled IVAO ATC bookings for today and next 2 days")
 @app_commands.describe(
     icao="Filter by airport ICAO (leave blank for all)",
@@ -2225,7 +2382,7 @@ async def cmd_help(interaction: discord.Interaction) -> None:
 
     weather_names = ("atis", "metar", "pirep", "sigmet", "taf", "weather", "winds")
     airport_names = ("airport", "charts", "nearby", "runway", "sat", "spicy", "summary", "xwind")
-    network_names = ("bookings", "events", "inbounds", "ivao", "ivaobookings", "ivaocount", "ivaoevents", "ivaoinbounds", "ranked", "stats", "upcoming", "vatsim", "vatsimcount")
+    network_names = ("bookings", "events", "inbounds", "ivao", "ivaobookings", "ivaocount", "ivaoevents", "ivaoinbounds", "ivaolookup", "ivaostats", "ranked", "stats", "upcoming", "vatsim", "vatsimcount")
     simbrief_names = ("airlines", "myplan", "postflight")
     utility_names = ("convert", "distance")
     meta_names = ("gnd-twr-alerts", "help", "info", "ping")
