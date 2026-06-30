@@ -2018,6 +2018,63 @@ async def cmd_sat(interaction: discord.Interaction, icao: str) -> None:
     )
 
 
+@bot.tree.command(name="ivaobookings", description="Scheduled IVAO ATC bookings for today and next 2 days")
+@app_commands.describe(
+    icao="Filter by airport ICAO (leave blank for all)",
+    limit="Max bookings to show (1–30)",
+)
+async def cmd_ivaobookings(
+    interaction: discord.Interaction,
+    icao: str = "",
+    limit: app_commands.Range[int, 1, 30] = 15,
+) -> None:
+    session = bot.http_session
+    assert session is not None
+    code = icao.strip().upper()
+    if code and (len(code) != 4 or not code.isalnum()):
+        await interaction.response.send_message("ICAO must be 4 alphanumeric characters.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)
+    kwargs: dict[str, str] = {"limit": str(limit)}
+    if code:
+        kwargs["icao"] = code
+    status, data = await _hub_get(session, "/api/ivao/bookings", **kwargs)
+    if status != 200:
+        await interaction.followup.send(
+            f"Hub returned **{status}**: `{data.get('error', data)}`", ephemeral=True
+        )
+        return
+    bookings = data.get("bookings") or []
+    cnt      = data.get("count", len(bookings))
+    if not bookings:
+        where = f" for **`{code}`**" if code else ""
+        await interaction.followup.send(f"No IVAO ATC bookings found{where}.")
+        return
+
+    def _fmt(b: dict[str, Any]) -> str:
+        cs   = b.get("callsign") or "?"
+        name = b.get("controller") or "?"
+        rat  = b.get("rating") or ""
+        div  = b.get("division") or ""
+        freq = b.get("frequency") or 0
+        ts_s = _iso_to_unix(b.get("starts_at") or "")
+        ts_e = _iso_to_unix(b.get("ends_at") or "")
+        when = (f" · <t:{ts_s}:t>–<t:{ts_e}:t>" if ts_s and ts_e else
+                f" · from <t:{ts_s}:t>" if ts_s else "")
+        meta = [x for x in [rat, div, f"{freq:.3f}" if freq else ""] if x]
+        meta_str = f" ({', '.join(meta)})" if meta else ""
+        return f"`{cs}` · {name}{meta_str}{when}"
+
+    title_str = "IVAO bookings" + (f" — {code}" if code else "") + f" ({cnt} total)"
+    embed = discord.Embed(
+        title=title_str,
+        description=_truncate("\n".join(_fmt(b) for b in bookings), 3900),
+        color=discord.Color.blue(),
+    )
+    embed.set_footer(text="Advisory only · Aviation Hub DB (updated every 30 min from IVAO API)")
+    await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="ivaoevents", description="Upcoming IVAO events (from Aviation Hub DB)")
 @app_commands.describe(limit="Max events to show (1–20)")
 async def cmd_ivaoevents(
@@ -2168,7 +2225,7 @@ async def cmd_help(interaction: discord.Interaction) -> None:
 
     weather_names = ("atis", "metar", "pirep", "sigmet", "taf", "weather", "winds")
     airport_names = ("airport", "charts", "nearby", "runway", "sat", "spicy", "summary", "xwind")
-    network_names = ("bookings", "events", "inbounds", "ivao", "ivaocount", "ivaoevents", "ivaoinbounds", "ranked", "stats", "upcoming", "vatsim", "vatsimcount")
+    network_names = ("bookings", "events", "inbounds", "ivao", "ivaobookings", "ivaocount", "ivaoevents", "ivaoinbounds", "ranked", "stats", "upcoming", "vatsim", "vatsimcount")
     simbrief_names = ("airlines", "myplan", "postflight")
     utility_names = ("convert", "distance")
     meta_names = ("gnd-twr-alerts", "help", "info", "ping")

@@ -28,6 +28,7 @@ from fetchers.ingest_vatsim_events import FEED_NAME as VATSIM_EVENTS_FEED, proce
 from fetchers.vatsim import FEED_NAME as VATSIM_FEED, next_poll_seconds, process_vatsim_network
 from fetchers.ivao import FEED_NAME as IVAO_FEED, process_ivao_network
 from fetchers.ivao_events import process_ivao_events
+from fetchers.ingest_ivao_atc_bookings import process_ivao_atc_bookings
 from util import configure_logging, utc_now_iso
 from widget_server import start_widget_server
 
@@ -204,6 +205,10 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
         ),
         "ivao_events": PollState(
             interval=_env_poll_seconds("IVAO_EVENTS_POLL_SECONDS", 1800),  # every 30 min
+            next_run=0.0,
+        ),
+        "ivao_bookings": PollState(
+            interval=_env_poll_seconds("IVAO_BOOKINGS_POLL_SECONDS", 1800),  # every 30 min
             next_run=0.0,
         ),
     }
@@ -404,6 +409,14 @@ def run_cycle(conn: sqlite3.Connection, session: requests.Session, *, once: bool
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("IVAO events processing failed: %s", exc)
             polls["ivao_events"].next_run = now + polls["ivao_events"].interval
+
+        if now >= polls["ivao_bookings"].next_run:
+            try:
+                LOGGER.info("Checking ivao_bookings")
+                process_ivao_atc_bookings(conn, session)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("IVAO bookings processing failed: %s", exc)
+            polls["ivao_bookings"].next_run = now + polls["ivao_bookings"].interval
 
         sleep_for = max(1.0, min(state.next_run for state in polls.values()) - time.time())
         STOP_EVENT.wait(timeout=sleep_for)

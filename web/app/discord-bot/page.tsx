@@ -82,6 +82,7 @@ const COMMAND_GROUPS: CommandGroup[] = [
     label: "IVAO",
     commands: [
       { name: "/ivao", description: "IVAO online ATC for an airport" },
+      { name: "/ivaobookings", description: "Scheduled IVAO ATC bookings (today + 2 days)" },
       { name: "/ivaoevents", description: "Upcoming IVAO events" },
       { name: "/ivaoinbounds", description: "Pilots filed to land at an ICAO (IVAO snapshot)" },
       { name: "/ivaocount", description: "Total pilots & controllers currently online on IVAO" },

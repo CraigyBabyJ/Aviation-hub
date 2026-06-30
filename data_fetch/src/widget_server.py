@@ -2520,6 +2520,9 @@ class WidgetHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/ivao/events":
                 self._handle_ivao_events(parsed.query)
                 return
+            if parsed.path == "/api/ivao/bookings":
+                self._handle_ivao_bookings(parsed.query)
+                return
             if parsed.path == AIRPORTS_UPCOMING_PATH:
                 self._handle_airports_upcoming(parsed.query)
                 return
@@ -2907,6 +2910,60 @@ class WidgetHandler(BaseHTTPRequestHandler):
             for row in rows
         ]
         self._send_json(HTTPStatus.OK, {"events": events, "count": len(events)})
+
+    def _handle_ivao_bookings(self, query: str) -> None:
+        limit  = _parse_limit_from_query(query, default=50, max_limit=200)
+        params = urllib.parse.parse_qs(query)
+        icao   = (params.get("icao", [""])[0] or "").strip().upper() or None
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                if icao:
+                    rows = conn.execute(
+                        """
+                        SELECT booking_id, callsign, airport_icao, position_type,
+                               controller_name, rating, division, frequency,
+                               starts_at_utc, ends_at_utc, training
+                        FROM ivao_atc_bookings_latest
+                        WHERE airport_icao = ?
+                          AND ends_at_utc >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', 'utc')
+                        ORDER BY starts_at_utc ASC
+                        LIMIT ?
+                        """,
+                        (icao, limit),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT booking_id, callsign, airport_icao, position_type,
+                               controller_name, rating, division, frequency,
+                               starts_at_utc, ends_at_utc, training
+                        FROM ivao_atc_bookings_latest
+                        WHERE ends_at_utc >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', 'utc')
+                        ORDER BY starts_at_utc ASC
+                        LIMIT ?
+                        """,
+                        (limit,),
+                    ).fetchall()
+        except sqlite3.OperationalError as exc:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+            return
+        bookings = [
+            {
+                "id":          row["booking_id"],
+                "callsign":    row["callsign"],
+                "airport":     row["airport_icao"] or "",
+                "position":    row["position_type"] or "",
+                "controller":  row["controller_name"] or "",
+                "rating":      row["rating"] or "",
+                "division":    row["division"] or "",
+                "frequency":   row["frequency"] or 0,
+                "starts_at":   row["starts_at_utc"],
+                "ends_at":     row["ends_at_utc"],
+                "training":    row["training"],
+            }
+            for row in rows
+        ]
+        self._send_json(HTTPStatus.OK, {"bookings": bookings, "count": len(bookings)})
 
     def _handle_vatsim_airports(self, query: str) -> None:
         limit = _parse_limit_from_query(query, default=50, max_limit=200)

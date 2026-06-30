@@ -547,6 +547,27 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_vatsim_bookings_starts
             ON vatsim_atc_bookings_latest (starts_at_utc);
 
+        CREATE TABLE IF NOT EXISTS ivao_atc_bookings_latest (
+            booking_id   INTEGER PRIMARY KEY,
+            callsign     TEXT NOT NULL,
+            airport_icao TEXT,
+            position_type TEXT,
+            controller_name TEXT,
+            controller_vid  INTEGER,
+            rating       TEXT,
+            division     TEXT,
+            frequency    REAL,
+            starts_at_utc TEXT NOT NULL,
+            ends_at_utc   TEXT NOT NULL,
+            training     TEXT,
+            fetched_at_utc TEXT NOT NULL,
+            raw_json     TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ivao_bookings_airport
+            ON ivao_atc_bookings_latest (airport_icao);
+        CREATE INDEX IF NOT EXISTS idx_ivao_bookings_starts
+            ON ivao_atc_bookings_latest (starts_at_utc);
+
         CREATE VIEW IF NOT EXISTS airports_with_upcoming_events AS
         SELECT DISTINCT
             json_each.value AS airport_icao,
