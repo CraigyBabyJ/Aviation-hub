@@ -2505,6 +2505,12 @@ class WidgetHandler(BaseHTTPRequestHandler):
             if parsed.path == IVAO_AIRPORT_PATH:
                 self._handle_ivao_airport(parsed.query)
                 return
+            if parsed.path == "/api/ivao/count":
+                self._handle_ivao_count(parsed.query)
+                return
+            if parsed.path == "/api/ivao/inbounds":
+                self._handle_ivao_inbounds(parsed.query)
+                return
             if parsed.path == IVAO_CONTROLLERS_PATH:
                 self._handle_ivao_controllers(parsed.query)
                 return
@@ -2733,6 +2739,54 @@ class WidgetHandler(BaseHTTPRequestHandler):
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"error": "ivao_table_unavailable", "detail": str(exc)},
             )
+
+    def _handle_ivao_count(self, query: str) -> None:
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                pilots  = conn.execute("SELECT COUNT(*) FROM ivao_pilots_latest").fetchone()[0]
+                atc     = conn.execute("SELECT COUNT(*) FROM ivao_atc_latest WHERE position IS NOT NULL AND position != 'OBS'").fetchone()[0]
+                updated = conn.execute("SELECT MAX(last_updated) FROM ivao_pilots_latest").fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+            return
+        self._send_json(HTTPStatus.OK, {"pilots": pilots, "atc": atc, "updated_at": updated})
+
+    def _handle_ivao_inbounds(self, query: str) -> None:
+        icao, error = _parse_icao_from_query(query)
+        if error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": error})
+            return
+        limit = _parse_limit_from_query(query, default=40, max_limit=100)
+        try:
+            with _open_readonly_connection(self.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT callsign, departure, arrival, altitude, groundspeed, aircraft_type
+                    FROM ivao_pilots_latest
+                    WHERE arrival = ?
+                    ORDER BY callsign
+                    LIMIT ?
+                    """,
+                    (icao, limit),
+                ).fetchall()
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM ivao_pilots_latest WHERE arrival = ?", (icao,)
+                ).fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
+            return
+        pilots = [
+            {
+                "callsign":    row["callsign"],
+                "departure":   row["departure"] or "",
+                "arrival":     row["arrival"] or "",
+                "altitude":    row["altitude"] or 0,
+                "groundspeed": row["groundspeed"] or 0,
+                "aircraft":    row["aircraft_type"] or "",
+            }
+            for row in rows
+        ]
+        self._send_json(HTTPStatus.OK, {"pilots": pilots, "count": total, "icao": icao})
 
     def _handle_ivao_controllers(self, query: str) -> None:
         IVAO_RATING: dict[int, str] = {

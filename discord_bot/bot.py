@@ -2018,6 +2018,146 @@ async def cmd_sat(interaction: discord.Interaction, icao: str) -> None:
     )
 
 
+@bot.tree.command(name="ivaoevents", description="Upcoming IVAO events (from Aviation Hub DB)")
+@app_commands.describe(limit="Max events to show (1–20)")
+async def cmd_ivaoevents(
+    interaction: discord.Interaction,
+    limit: app_commands.Range[int, 1, 20] = 10,
+) -> None:
+    session = bot.http_session
+    assert session is not None
+    await interaction.response.defer(thinking=True)
+    status, data = await _hub_get(session, "/api/ivao/events", limit=str(limit))
+    if status != 200:
+        await interaction.followup.send(
+            f"Hub returned **{status}**: `{data.get('error', data)}`", ephemeral=True
+        )
+        return
+    events = data.get("events") or []
+    if not events:
+        await interaction.followup.send("No IVAO events in the database yet — check back shortly.")
+        return
+
+    lines: list[str] = []
+    for ev in events:
+        title   = ev.get("title") or "?"
+        date_l  = ev.get("date_label") or ""
+        time_l  = ev.get("time_label") or ""
+        airports = ev.get("airports") or []
+        url     = ev.get("url") or ""
+        where   = ", ".join(f"`{a}`" for a in airports) if airports else "—"
+        when    = f"{date_l}" + (f" · {time_l}" if time_l else "")
+        link    = f" · [Details]({url})" if url else ""
+        lines.append(f"**{title}**\n{when}\nAirports: {where}{link}")
+
+    per = 5
+    chunks = [lines[i : i + per] for i in range(0, len(lines), per)]
+    for idx, chunk in enumerate(chunks):
+        title_str = "IVAO upcoming events"
+        if len(chunks) > 1:
+            title_str += f" (part {idx + 1}/{len(chunks)})"
+        embed = discord.Embed(
+            title=title_str,
+            description=_truncate("\n\n".join(chunk), 3900),
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(text="Source: ivao.events · Aviation Hub DB")
+        if idx == 0:
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="ivaoinbounds", description="IVAO pilots currently filed to land at an airport")
+@app_commands.describe(icao="4-letter ICAO", limit="Max pilots to list (1–60)")
+async def cmd_ivaoinbounds(
+    interaction: discord.Interaction,
+    icao: str,
+    limit: app_commands.Range[int, 1, 60] = 40,
+) -> None:
+    session = bot.http_session
+    assert session is not None
+    code = icao.strip().upper()
+    if len(code) != 4 or not code.isalnum():
+        await interaction.response.send_message("ICAO must be 4 alphanumeric characters.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True)
+    status, data = await _hub_get(session, "/api/ivao/inbounds", icao=code, limit=str(limit))
+    if status != 200:
+        await interaction.followup.send(
+            f"Hub returned **{status}**: `{data.get('error', data)}`", ephemeral=True
+        )
+        return
+    pilots = data.get("pilots") or []
+    cnt    = data.get("count", len(pilots))
+    if not pilots:
+        await interaction.followup.send(
+            f"**0** IVAO pilots currently filed for **`{code}`** as arrival."
+        )
+        return
+
+    def _lines(chunk: list[dict[str, Any]]) -> str:
+        out: list[str] = []
+        for p in chunk:
+            cs  = p.get("callsign") or "?"
+            dep = p.get("departure") or "?"
+            ac  = (p.get("aircraft") or "").strip()
+            gs  = p.get("groundspeed")
+            tail = f" · {ac}" if ac else ""
+            if gs:
+                tail += f" · {gs} gs"
+            out.append(f"`{cs}` {dep}→**{code}**{tail}")
+        return "\n".join(out)
+
+    per = 14
+    chunks = [pilots[i : i + per] for i in range(0, len(pilots), per)]
+    for idx, chunk in enumerate(chunks):
+        title_str = f"IVAO inbounds → {code} ({cnt} total)"
+        if len(chunks) > 1:
+            title_str += f" — part {idx + 1}/{len(chunks)}"
+        embed = discord.Embed(
+            title=title_str,
+            description=_truncate(_lines(chunk), 3900),
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(text="Live IVAO snapshot · Aviation Hub DB (updated every 60 s)")
+        if idx == 0:
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="ivaocount", description="Total pilots and controllers currently online on IVAO")
+async def cmd_ivaocount(interaction: discord.Interaction) -> None:
+    session = bot.http_session
+    assert session is not None
+    await interaction.response.defer(thinking=True)
+    status, data = await _hub_get(session, "/api/ivao/count")
+    if status != 200:
+        await interaction.followup.send(
+            f"Hub returned **{status}**: `{data.get('error', data)}`", ephemeral=True
+        )
+        return
+    pilots  = data.get("pilots", 0)
+    atc     = data.get("atc", 0)
+    updated = data.get("updated_at") or ""
+    ts      = _iso_to_unix(updated)
+    update_str = f"<t:{ts}:R>" if ts else (updated[:19] if updated else "—")
+    lines = [
+        f"**Pilots online:** {pilots:,}",
+        f"**ATC online:** {atc:,}",
+        f"**Total connected:** {pilots + atc:,}",
+        f"**Snapshot:** {update_str}",
+    ]
+    embed = discord.Embed(
+        title="IVAO online now",
+        description="\n".join(lines),
+        color=discord.Color.blue(),
+    )
+    embed.set_footer(text="Source: Aviation Hub DB (IVAO whazzup, updated every 60 s)")
+    await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(
     name="help",
     description="Show every slash command and its description",
@@ -2028,7 +2168,7 @@ async def cmd_help(interaction: discord.Interaction) -> None:
 
     weather_names = ("atis", "metar", "pirep", "sigmet", "taf", "weather", "winds")
     airport_names = ("airport", "charts", "nearby", "runway", "sat", "spicy", "summary", "xwind")
-    network_names = ("bookings", "events", "inbounds", "ivao", "ranked", "stats", "upcoming", "vatsim", "vatsimcount")
+    network_names = ("bookings", "events", "inbounds", "ivao", "ivaocount", "ivaoevents", "ivaoinbounds", "ranked", "stats", "upcoming", "vatsim", "vatsimcount")
     simbrief_names = ("airlines", "myplan", "postflight")
     utility_names = ("convert", "distance")
     meta_names = ("gnd-twr-alerts", "help", "info", "ping")

@@ -67,17 +67,30 @@ const COMMAND_GROUPS: CommandGroup[] = [
     ],
   },
   {
-    label: "VATSIM & IVAO",
+    label: "VATSIM",
     commands: [
       { name: "/vatsim", description: "Flight, ATC callsign, or airport ICAO lookup" },
       { name: "/bookings", description: "VATSIM ATC bookings (advisory)" },
       { name: "/events", description: "VATSIM events in the next N days" },
       { name: "/inbounds", description: "Pilots filed to land at an ICAO (VATSIM snapshot)" },
-      { name: "/ivao", description: "IVAO online ATC for an airport" },
-      { name: "/ranked", description: "Best airports now: live ATC, traffic & weather" },
+      { name: "/vatsimcount", description: "Total pilots & controllers currently online on VATSIM" },
       { name: "/stats", description: "VATSIM member stats: rating, pilot & ATC hours" },
       { name: "/upcoming", description: "Upcoming bookings/events by airport (next N hours)" },
-      { name: "/vatsimcount", description: "Total pilots & controllers currently online on VATSIM" },
+    ],
+  },
+  {
+    label: "IVAO",
+    commands: [
+      { name: "/ivao", description: "IVAO online ATC for an airport" },
+      { name: "/ivaoevents", description: "Upcoming IVAO events" },
+      { name: "/ivaoinbounds", description: "Pilots filed to land at an ICAO (IVAO snapshot)" },
+      { name: "/ivaocount", description: "Total pilots & controllers currently online on IVAO" },
+    ],
+  },
+  {
+    label: "Both Networks",
+    commands: [
+      { name: "/ranked", description: "Best airports now: live ATC, traffic & weather" },
     ],
   },
   {
